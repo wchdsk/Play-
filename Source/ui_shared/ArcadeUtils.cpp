@@ -234,6 +234,10 @@ ARCADE_MACHINE_DEF ReadArcadeMachineDefinition(const fs::path& arcadeDefPath)
 	{
 		def.useInternalCardReader = defJson["useInternalCardReader"];
 	}
+	if(defJson.contains("cardReaderShutter"))
+	{
+		def.cardReaderShutter = defJson["cardReaderShutter"];
+	}
 	if(defJson.contains("screenPosXform"))
 	{
 		auto screenPosXformArray = defJson["screenPosXform"];

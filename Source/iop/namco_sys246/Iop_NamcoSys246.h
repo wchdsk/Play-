@@ -44,6 +44,8 @@ namespace Iop
 
 			void SetJvsMode(JVS_MODE);
 			void SetBoardId(std::string);
+			//Drives the shutter emulation, see the machine definition setting of the same name.
+			void SetCardReaderShutter(bool value) { m_cardReaderShutter = value; }
 			void SetButton(unsigned int, PS2::CControllerInfo::BUTTON);
 			void SetScreenPosXform(const std::array<float, 4>&);
 
@@ -222,6 +224,9 @@ namespace Iop
 
 			//Card reader door emulation
 			uint32 m_doorState = DOOR_STATE_CLOSED;
+			//When clear the shutter is not driven at all and reports as open, so games that
+			//wait for the door to move keep going.
+			bool m_cardReaderShutter = true;
 			uint32 m_doorPollCounter = 0;
 			bool m_doorMotorOn = false;
 			std::string m_lastDoorOutputDump;

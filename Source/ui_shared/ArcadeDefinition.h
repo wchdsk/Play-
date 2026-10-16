@@ -60,6 +60,8 @@ struct ARCADE_MACHINE_DEF
 	//commands are only forwarded to arcadeSerialPort, which is what an external reader
 	//manager expects.
 	bool useInternalCardReader = true;
+	//Emulates the shutter (door) of the card reader.
+	bool cardReaderShutter = true;
 	std::optional<IlinkId> ilinkId;
 	std::array<float, 4> screenPosXform = {65535, 0, 65535, 0};
 	uint32 eeFreqScaleNumerator = 1;

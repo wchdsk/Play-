@@ -770,6 +770,8 @@ void CSys246::SetDoorMotorState(bool on)
 
 void CSys246::TickDoor()
 {
+	if(!m_cardReaderShutter) return;
+
 	UpdateDoorOverride();
 
 	//The door position can be forced from a file, which makes it possible to find out
@@ -977,6 +979,9 @@ void CSys246::UpdateDoorOverride()
 
 uint16 CSys246::GetDoorSwitchBits() const
 {
+	//Shutter emulation disabled: report the door as open so nothing blocks on it.
+	if(!m_cardReaderShutter) return DOOR_SWITCH_BITS_OPEN;
+
 	//The bits can be forced from the configuration file, which allows combinations that no
 	//position of the mechanism produces to be tried out
 	if(m_doorBitsForced) return static_cast<uint16>(m_doorBitsValue & 0xFFFF);

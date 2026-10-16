@@ -141,6 +141,7 @@ void CNamcoSys246Driver::PrepareEnvironment(CPS2VM* virtualMachine, const ARCADE
 			if(!def.boardId.empty())
 			{
 				namcoArcadeModule->SetBoardId(def.boardId);
+				namcoArcadeModule->SetCardReaderShutter(def.cardReaderShutter);
 			}
 		}
 
