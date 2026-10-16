@@ -254,7 +254,17 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 	{
 		if(!caps.texBilinearFilter)
 		{
-			shaderBuilder << "	float colorIndex = texture(g_texture, texCoord.st).r * 255.0;" << std::endl;
+			//Indexed textures are sampled by hand here (the palette index is in the red
+			//channel), so the texel has to be picked in texel index space, exactly like the
+			//hardware does: the index is floor(u * size - 0.5) and it is converted back to a
+			//sampling coordinate as (index + 0.5) / size. Sampling at u directly lands on index
+			//"size" on the last column, and the sampler's REPEAT wrap then turns that into the
+			//opposite edge texel, which blends the first column into the last one (visible as a
+			//translucent band at the seam of a texture that was split over several draws).
+			shaderBuilder << "	highp vec2 texelPos = texCoord.st * g_textureSize - vec2(0.5);" << std::endl;
+			shaderBuilder << "	highp vec2 texelIndex = floor(texelPos);" << std::endl;
+			shaderBuilder << "	vec2 texelCoord = (texelIndex + vec2(0.5)) * g_texelSize;" << std::endl;
+			shaderBuilder << "	float colorIndex = texture(g_texture, texelCoord).r * 255.0;" << std::endl;
 			if(caps.texSourceMode == TEXTURE_SOURCE_MODE_IDX4)
 			{
 				shaderBuilder << "	float paletteTexelBias = 0.5 / 16.0;" << std::endl;
@@ -268,10 +278,24 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 		}
 		else
 		{
-			shaderBuilder << "	float tlIdx = texture(g_texture, texCoord.st                                     ).r * 255.0;" << std::endl;
-			shaderBuilder << "	float trIdx = texture(g_texture, texCoord.st + vec2(g_texelSize.x, 0)            ).r * 255.0;" << std::endl;
-			shaderBuilder << "	float blIdx = texture(g_texture, texCoord.st + vec2(0, g_texelSize.y)            ).r * 255.0;" << std::endl;
-			shaderBuilder << "	float brIdx = texture(g_texture, texCoord.st + vec2(g_texelSize.x, g_texelSize.y)).r * 255.0;" << std::endl;
+			//Bilinear neighbourhood, likewise in texel index space. Only the second tap can
+			//leave the texture: when the sample point already sits on the last texel, the
+			//hardware takes that same texel again instead of wrapping round to the opposite
+			//edge - wrapping would blend the first column into the last one, which is the
+			//translucent band seen at the seam of a texture split over several draws. Genuinely
+			//tiled textures (coordinate beyond the texture) still wrap as before.
+			shaderBuilder << "	highp vec2 texelPos = texCoord.st * g_textureSize - vec2(0.5);" << std::endl;
+			shaderBuilder << "	highp vec2 texelWeight = fract(texelPos);" << std::endl;
+			shaderBuilder << "	highp vec2 texelIndex0 = floor(texelPos);" << std::endl;
+			shaderBuilder << "	highp vec2 texelIndex1 = texelIndex0 + vec2(1.0);" << std::endl;
+			shaderBuilder << "	if((texelIndex1.x >= g_textureSize.x) && (texelIndex0.x < g_textureSize.x)) texelIndex1.x = texelIndex0.x;" << std::endl;
+			shaderBuilder << "	if((texelIndex1.y >= g_textureSize.y) && (texelIndex0.y < g_textureSize.y)) texelIndex1.y = texelIndex0.y;" << std::endl;
+			shaderBuilder << "	vec2 texelCoord0 = (texelIndex0 + vec2(0.5)) * g_texelSize;" << std::endl;
+			shaderBuilder << "	vec2 texelCoord1 = (texelIndex1 + vec2(0.5)) * g_texelSize;" << std::endl;
+			shaderBuilder << "	float tlIdx = texture(g_texture, vec2(texelCoord0.x, texelCoord0.y)).r * 255.0;" << std::endl;
+			shaderBuilder << "	float trIdx = texture(g_texture, vec2(texelCoord1.x, texelCoord0.y)).r * 255.0;" << std::endl;
+			shaderBuilder << "	float blIdx = texture(g_texture, vec2(texelCoord0.x, texelCoord1.y)).r * 255.0;" << std::endl;
+			shaderBuilder << "	float brIdx = texture(g_texture, vec2(texelCoord1.x, texelCoord1.y)).r * 255.0;" << std::endl;
 
 			if(caps.texSourceMode == TEXTURE_SOURCE_MODE_IDX4)
 			{
@@ -290,7 +314,7 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 				shaderBuilder << "	vec4 br = expandAlpha(texture(g_palette, vec2(brIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
 			}
 
-			shaderBuilder << "	highp vec2 f = fract(texCoord.st * g_textureSize);" << std::endl;
+			shaderBuilder << "	highp vec2 f = texelWeight;" << std::endl;
 			shaderBuilder << "	vec4 tA = mix(tl, tr, f.x);" << std::endl;
 			shaderBuilder << "	vec4 tB = mix(bl, br, f.x);" << std::endl;
 			shaderBuilder << "	textureColor = mix(tA, tB, f.y);" << std::endl;
