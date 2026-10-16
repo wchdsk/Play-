@@ -24,7 +24,17 @@ namespace Iop
 			//serial port, leaving the cards to the real hardware or an external manager.
 			void SetInternalCardReader(bool value) { m_internalCardReader = value; }
 			//Selects the serial port of the real card reader, see the "arcadeSerialPort" setting.
-			void SetSerialPort(const std::string& value) { m_serialPort = value; }
+			//The port is only used when the reader is not emulated internally, and it is opened
+			//here because the value only becomes known after the module was constructed. Opening
+			//is idempotent, only the first instance that gets here wins.
+			void SetSerialPort(const std::string& value)
+			{
+				m_serialPort = value;
+				if(!m_internalCardReader)
+				{
+					OpenSerialPortIfConfigured();
+				}
+			}
 			CArcadeSpy(std::string, uint8*);
 
 			std::string GetId() const override;
