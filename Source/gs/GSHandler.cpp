@@ -143,6 +143,17 @@ void CGSHandler::SetIntc(CINTC* intc)
 
 void CGSHandler::Reset()
 {
+	//ResetBase clears the write buffer without submitting it, so a reset issued while a frame's
+	//register writes are still queued (the game does one on LoadExecPS2, i.e. on scene changes)
+	//silently discards that tail - a primitive written right before the reset disappears, in every
+	//renderer. Submit the pending range first and wait until the GS thread has consumed everything
+	//queued so far, then reset.
+	if(m_writeBufferSize != 0)
+	{
+		FlushWriteBuffer();
+	}
+	SendGSCall([]() {}, true, true);
+
 	ResetBase();
 	SendGSCall(std::bind(&CGSHandler::ResetImpl, this), true);
 }

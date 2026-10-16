@@ -167,7 +167,7 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 				}
 				else
 				{
-					m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZ2, temp));
+				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZ2, temp));
 				}
 				break;
 			case 0x06:
@@ -453,7 +453,13 @@ void CGIF::ProcessFifoWrite(uint32 address, uint32 value)
 	static constexpr uint32 qwSize = 0x10;
 	*reinterpret_cast<uint32*>(m_fifoBuffer + m_fifoIndex) = value;
 	m_fifoIndex += 4;
-	if(m_fifoIndex == qwSize)
+	//The FIFO has to be drained as soon as a whole qword is in it. This check used to be an exact
+	//comparison against 0x10, so as soon as ReceiveDMA buffered whole qwords into the FIFO
+	//(m_fifoIndex becoming 0x20, 0x30, ...) it could never match again: the FIFO stopped draining,
+	//the next write went past the end of m_fifoBuffer, and whichever packet was stuck in it was
+	//never consumed - its register writes never reached the GS handler, so its primitives were
+	//missing in every renderer.
+	if(m_fifoIndex >= qwSize)
 	{
 		DrainFifo();
 	}
@@ -589,6 +595,11 @@ void CGIF::SetRegister(uint32 address, uint32 value)
 		{
 		case GIF_MODE:
 			m_MODE = value;
+			//M3R (bit 0) masks PATH3 transfers. This register used to be stored and never read, so a
+			//game that unmasks PATH3 through GIF_MODE (instead of the VIF MSKPATH3 command) left the
+			//DMA channel suspended and that packet was never consumed: its register writes never
+			//reached the GS handler, so the primitives it contained were missing in every renderer.
+			SetPath3Masked((value & 0x1) != 0);
 			break;
 		}
 	}
