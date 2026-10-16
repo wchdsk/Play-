@@ -1126,10 +1126,10 @@ Framework::Vulkan::CShaderModule CDrawMobile::CreateDrawFragmentShader(const PIP
 			depthTestResult = NewBool(b, false);
 			break;
 		case CGSHandler::DEPTH_TEST_GEQUAL:
-			depthTestResult = srcDepth >= dstDepth;
+			depthTestResult = caps.mirrorDepthTest ? (srcDepth <= dstDepth) : (srcDepth >= dstDepth);
 			break;
 		case CGSHandler::DEPTH_TEST_GREATER:
-			depthTestResult = srcDepth > dstDepth;
+			depthTestResult = caps.mirrorDepthTest ? (srcDepth < dstDepth) : (srcDepth > dstDepth);
 			break;
 		}
 

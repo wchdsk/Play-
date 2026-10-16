@@ -267,6 +267,10 @@ private:
 	bool m_depthTestingEnabled = true;
 	bool m_alphaBlendingEnabled = true;
 	bool m_alphaTestingEnabled = true;
+	//Set while kicking a primitive whose vertices sit on the farthest GS plane (Z == 0). The GS depth
+	//axis points the opposite way of Vulkan's, so those primitives need a mirrored depth comparison
+	//to stay visible over depth that the 3D pass already wrote (2D overlays drawn at Z = 0).
+	bool m_currentPrimitiveZIsZero = false;
 
 	Framework::Vulkan::CImage m_swizzleTablePSMCT32;
 	Framework::Vulkan::CImage m_swizzleTablePSMCT16;

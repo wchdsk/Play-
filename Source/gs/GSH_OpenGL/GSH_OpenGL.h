@@ -403,6 +403,10 @@ private:
 	bool m_depthTestingEnabled = true;
 	bool m_alphaBlendingEnabled = true;
 	bool m_alphaTestingEnabled = true;
+	//Set while kicking a primitive whose vertices all have Z == 0 (i.e. the farthest GS plane).
+	//The GS depth axis points the opposite way of OpenGL's, so such primitives need a mirrored
+	//comparison to be visible over depth that the 3D pass already wrote.
+	bool m_currentPrimitiveZIsZero = false;
 
 	uint8* m_pCvtBuffer;
 

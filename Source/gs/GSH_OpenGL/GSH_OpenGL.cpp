@@ -938,10 +938,13 @@ void CGSH_OpenGL::SetupTestFunctions(uint64 testReg)
 			nFunc = GL_ALWAYS;
 			break;
 		case DEPTH_TEST_GEQUAL:
-			nFunc = GL_GEQUAL;
+			//Primitives on the farthest GS plane (Z == 0) get a mirrored comparison: the GS depth axis
+			//is the opposite of OpenGL's, and without this a 2D overlay at Z = 0 is rejected by depth
+			//that the 3D pass wrote. Everything else keeps the straight mapping.
+			nFunc = m_currentPrimitiveZIsZero ? GL_LEQUAL : GL_GEQUAL;
 			break;
 		case DEPTH_TEST_GREATER:
-			nFunc = GL_GREATER;
+			nFunc = m_currentPrimitiveZIsZero ? GL_LESS : GL_GREATER;
 			break;
 		}
 
@@ -2008,6 +2011,27 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
 		m_VtxBuffer[m_nVtxCount - 1].uv = m_nReg[GS_REG_UV];
 		m_VtxBuffer[m_nVtxCount - 1].st = m_nReg[GS_REG_ST];
 		m_VtxBuffer[m_nVtxCount - 1].fog = (uint8)(m_nReg[GS_REG_FOG] >> 56);
+	}
+
+	//Remember whether this primitive sits on the farthest GS plane (Z == 0). The GS depth axis points
+	//the opposite way of OpenGL's, so only such primitives need a mirrored depth comparison - they
+	//would otherwise be rejected by depth the 3D pass already wrote (a 2D overlay drawn at Z = 0).
+	{
+		//The mirrored comparison is only for 2D overlays: primitives on the farthest plane (Z == 0)
+		//that are drawn while depth writes are disabled (ZBUF.ZMSK != 0). Background geometry uses
+		//Z == 0 as well, but it is drawn with depth writes enabled and must keep the straight
+		//comparison, otherwise it covers the 3D content it is supposed to sit behind.
+		uint64 primReg = ((m_nReg[GS_REG_PRMODECONT] & 1) != 0) ? m_nReg[GS_REG_PRIM] : m_nReg[GS_REG_PRMODE];
+		uint32 context = static_cast<uint32>((primReg >> 9) & 1);
+		auto zbuf = make_convertible<ZBUF>(m_nReg[GS_REG_ZBUF_1 + context]);
+		bool previousZIsZero = m_currentPrimitiveZIsZero;
+		m_currentPrimitiveZIsZero = (((m_VtxBuffer[m_nVtxCount - 1].position >> 32) == 0) && (zbuf.nMask != 0));
+		if(m_currentPrimitiveZIsZero != previousZIsZero)
+		{
+			//The depth comparison depends on this flag, but SetupTestFunctions only runs when the GS
+			//state itself changes, so re-apply it whenever a primitive switches between the two.
+			SetupTestFunctions(m_nReg[GS_REG_TEST_1 + context]);
+		}
 	}
 
 	m_nVtxCount--;

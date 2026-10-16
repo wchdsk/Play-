@@ -59,6 +59,9 @@ namespace GSH_Vulkan
 			uint32 fba : 1;
 
 			uint32 depthTestFunction : 2;
+			//Set when the primitive sits on the farthest GS plane (Z == 0), which needs a mirrored
+			//depth comparison because the GS depth axis is the opposite of Vulkan's.
+			uint32 mirrorDepthTest : 1;
 			uint32 alphaTestFunction : 3;
 			uint32 alphaTestFailAction : 2;
 

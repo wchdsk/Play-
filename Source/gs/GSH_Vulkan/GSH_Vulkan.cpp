@@ -667,6 +667,17 @@ void CGSH_Vulkan::VertexKick(uint8 registerId, uint64 data)
 		m_vtxBuffer[m_vtxCount - 1].fog = static_cast<uint8>(m_nReg[GS_REG_FOG] >> 56);
 	}
 
+	//Only 2D overlays are mirrored: primitives on the farthest plane (Z == 0) drawn while depth
+	//writes are disabled (ZBUF.ZMSK != 0). Background geometry also uses Z == 0, but it is drawn
+	//with depth writes enabled and must keep the straight comparison, otherwise it covers the 3D
+	//content it is supposed to sit behind.
+	{
+		uint64 primReg = ((m_nReg[GS_REG_PRMODECONT] & 1) != 0) ? m_nReg[GS_REG_PRIM] : m_nReg[GS_REG_PRMODE];
+		uint32 context = static_cast<uint32>((primReg >> 9) & 1);
+		auto zbuf = make_convertible<ZBUF>(m_nReg[GS_REG_ZBUF_1 + context]);
+		m_currentPrimitiveZIsZero = (((m_vtxBuffer[m_vtxCount - 1].position >> 32) == 0) && (zbuf.nMask != 0));
+	}
+
 	m_vtxCount--;
 
 	if(m_vtxCount == 0)
@@ -886,6 +897,10 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	}
 
 	pipelineCaps.depthTestFunction = test.nDepthMethod;
+	//Primitives on the farthest GS plane (Z == 0) get a mirrored comparison in the shader; the GS
+	//depth axis is the opposite of Vulkan's, so those 2D overlays would otherwise be rejected by the
+	//depth the 3D pass wrote. Everything else keeps the straight mapping.
+	pipelineCaps.mirrorDepthTest = m_currentPrimitiveZIsZero ? 1 : 0;
 	if(!test.nDepthEnabled || !m_depthTestingEnabled)
 	{
 		pipelineCaps.depthTestFunction = CGSHandler::DEPTH_TEST_ALWAYS;
