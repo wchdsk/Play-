@@ -1,5 +1,7 @@
+
 #include "Iop_NamcoArcadeSpy.h"
 #include "../../app_shared/Log.h"
+#include "Iop_NamcoArcadeLog.h"
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
@@ -19,7 +21,6 @@ using namespace Iop;
 using namespace Iop::Namco;
 
 #define LOG_NAME ("iop_namco_arcadespy")
-#define UART_REPLY_FILE ("arcade_uart_reply.txt")
 
 namespace
 {
@@ -29,11 +30,9 @@ namespace
 	//Card reader entries go through CLog like the rest of the emulator, so log.showprints
 //and LOGGING_ENABLED decide whether they are produced. Expanding to a macro also keeps
 //the argument formatting (and the hex dumps) out of builds where logging is compiled out.
-#if LOGGING_ENABLED
-#define CardLog(...) CLog::GetInstance().Print("arcade_card", __VA_ARGS__)
-#else
-#define CardLog(...) do { } while(0)
-#endif
+//The reader writes its entries through the arcade log, which is CLog when logging is
+//compiled in and a minimal always-on writer otherwise.
+#define CardLog(...) ArcadeLog(__VA_ARGS__)
 
 	//Calls are logged in full for the first few occurrences of each function, then only
 	//once in a while: drivers tend to poll some functions thousands of times in a row.
@@ -239,7 +238,10 @@ namespace
 	static const uint32 CARD_BUSY_POLLS = 4;
 
 	//Number of commands between two checks of the card control file
-	static const uint32 CARD_CONTROL_CHECK_COMMANDS = 32;
+	//Every command checks the control file: a card that is put in while the game waits for
+//one has to be seen straight away, and a timestamp comparison is cheap next to the
+//polling the games do.
+static const uint32 CARD_CONTROL_CHECK_COMMANDS = 1;
 
 	//Parses a decimal number used by the card control file
 	bool ParseControlNumber(const std::string& text, uint32& value)
@@ -413,10 +415,15 @@ CArcadeSpy::CArcadeSpy(std::string moduleId, uint8* iopRam)
     : m_moduleId(moduleId)
     , m_iopRam(iopRam)
 {
-	m_uartReplyPath = CAppConfig::GetInstance().GetBasePath() / UART_REPLY_FILE;
 	m_cardPath = CAppConfig::GetInstance().GetBasePath() / "arcadecards";
 	m_cardControlPath = CAppConfig::GetInstance().GetBasePath() / "arcade_card.txt";
-	m_serialConfigPath = CAppConfig::GetInstance().GetBasePath() / "arcade_serial.txt";
+	//The control file starts as manual: a command left over from an earlier run must not
+	//be acted upon when the reader comes up.
+	{
+		std::string initialCommand = "manual";
+		auto stream = Framework::CreateOutputStdStream(m_cardControlPath.native());
+		stream.Write(initialCommand.data(), static_cast<uint32>(initialCommand.size()));
+	}
 
 	//The serial port is shared: whichever instance opens it first is used by all of them
 	OpenSerialPortIfConfigured();
@@ -437,127 +444,7 @@ std::string CArcadeSpy::GetFunctionName(unsigned int functionId) const
 	return functionName ? std::string(functionName) : string_format("unknown_%d", static_cast<int>(functionId));
 }
 
-bool CArcadeSpy::TryLoadUartReplyFile()
-{
-	std::error_code errorCode;
-	if(!fs::exists(m_uartReplyPath, errorCode)) return false;
-	auto writeTime = fs::last_write_time(m_uartReplyPath, errorCode);
-	if(errorCode) return false;
-	if(m_uartReplyFileLoaded && (writeTime == m_uartReplyFileTime)) return false;
 
-	m_uartCommands.clear();
-	m_uartCommandSearchStart = 0;
-	m_uartSelectedCommand = static_cast<size_t>(-1);
-	m_uartSelectedReplyIndex = 0;
-	m_uartReadQueue.clear();
-	m_uartReplyFileLoaded = true;
-	m_uartReplyFileTime = writeTime;
-
-	try
-	{
-		auto stream = Framework::CreateInputStdStream(m_uartReplyPath.native());
-		uint64 size = stream.GetLength();
-		std::vector<char> contents(static_cast<size_t>(size) + 1);
-		stream.Read(contents.data(), static_cast<uint32>(size));
-		contents[static_cast<size_t>(size)] = 0;
-
-		//Parse the lines first: a serial capture log holds both directions, while a plain
-		//file just lists what the device connected to the port sends.
-		struct PARSED_LINE
-		{
-			bool fromDevice = false;
-			std::vector<uint8> bytes;
-		};
-		std::vector<PARSED_LINE> lines;
-		{
-			std::string currentLine;
-			auto flushLine = [&]() {
-				if(currentLine.empty()) return;
-				PARSED_LINE line;
-				line.fromDevice = (currentLine.find("DEV->CRW") != std::string::npos);
-				line.bytes = ParseHexBytes(currentLine);
-				if(!line.bytes.empty()) lines.push_back(line);
-				currentLine.clear();
-			};
-
-			for(char character : contents)
-			{
-				if((character == '\r') || (character == '\n'))
-				{
-					flushLine();
-				}
-				else if(character != 0)
-				{
-					currentLine += character;
-				}
-			}
-			flushLine();
-		}
-
-		bool hasRequests = false;
-		for(const auto& line : lines)
-		{
-			if(line.fromDevice && ((line.bytes.size() != 1) || (line.bytes[0] != UART_ENQ)))
-			{
-				hasRequests = true;
-				break;
-			}
-		}
-
-		if(hasRequests)
-		{
-			for(const auto& line : lines)
-			{
-				if(line.fromDevice)
-				{
-					//Anything but the ENQ byte starts a new command
-					if((line.bytes.size() != 1) || (line.bytes[0] != UART_ENQ))
-					{
-						UART_COMMAND_ENTRY entry;
-						entry.request = line.bytes;
-						m_uartCommands.push_back(entry);
-					}
-				}
-				else if(!m_uartCommands.empty())
-				{
-					if((line.bytes.size() == 1) && (line.bytes[0] == UART_ACK))
-					{
-						m_uartCommands.back().hasAck = true;
-					}
-					else
-					{
-						m_uartCommands.back().replies.push_back(line.bytes);
-					}
-				}
-			}
-		}
-		else
-		{
-			//A plain list of replies is answered to any command, in order
-			UART_COMMAND_ENTRY entry;
-			entry.hasAck = false;
-			for(const auto& line : lines)
-			{
-				entry.replies.push_back(line.bytes);
-			}
-			if(!entry.replies.empty()) m_uartCommands.push_back(entry);
-		}
-
-		size_t replyCount = 0;
-		for(const auto& command : m_uartCommands)
-		{
-			replyCount += command.replies.size();
-		}
-		CardLog( "uart reply file loaded: %d command(s), %d reply frame(s)\r\n",
-		                         static_cast<int>(m_uartCommands.size()), static_cast<int>(replyCount));
-	}
-	catch(...)
-	{
-		CardLog( "failed to load uart reply file.\r\n");
-		return false;
-	}
-	return true;
-}
 
 bool CArcadeSpy::ShouldLogUartCommand()
 {
@@ -616,82 +503,23 @@ void CArcadeSpy::QueueUartCommand(const uint8* command, uint32 size)
 	//is acknowledged with 0x06 and the result is fetched by the game with 0x05
 	if(HandleModelledCardCommand(command, size)) return;
 
-	//Everything else is answered from the captured reply file, so the modelled command the
-	//game was waiting on is over
-	m_cardCommand.active = false;
-
-	//Anything else is dumped here and answered from the captured reply file
-	if(size != 0)
-	{
-		CardLog("<< %s\r\n", FormatHexDump(command, size, 40).c_str());
-	}
-
-	HandleCardRequest(command, size);
-
-	std::vector<uint8> request(command, command + size);
-
-	//Find the next capture entry holding the same request, wrapping around when the end
-	//of the file is reached. This keeps repeated requests (the games poll the reader for
-	//its status a lot) answered with the proper reply instead of drifting to the replies
-	//of the commands that follow in the capture.
-	size_t entryIndex = static_cast<size_t>(-1);
-	for(size_t i = 0; i < m_uartCommands.size(); i++)
-	{
-		size_t index = (m_uartCommandSearchStart + i) % m_uartCommands.size();
-		if(m_uartCommands[index].request == request)
-		{
-			entryIndex = index;
-			break;
-		}
-	}
-	if(entryIndex == static_cast<size_t>(-1))
-	{
-		//Fall back to a plain reply list (no request associated to the replies)
-		for(size_t i = 0; i < m_uartCommands.size(); i++)
-		{
-			if(m_uartCommands[i].request.empty())
-			{
-				entryIndex = i;
-				break;
-			}
-		}
-	}
-	if(entryIndex == static_cast<size_t>(-1))
-	{
-		//The capture does not know this command. Answer it like a real reader would, otherwise
-		//the game never gets an acknowledge or a reply and reports an error. This happens for
-		//the commands that are only used while dispensing a card.
-		uint8 unknownCommand = (request.size() > 2) ? request[2] : 0;
-		m_useSyntheticReply = true;
-		m_syntheticReply = BuildSyntheticCardReply(unknownCommand);
-		//Acknowledge every complete frame, even when no reply is known for it: a real reader
-		//does that too, and the game would otherwise wait for the acknowledge forever.
-		bool isCompleteFrame = (request.size() >= 8) && (request[0] == 0x02) && (request[1] == (request.size() - 2));
-		if(isCompleteFrame && (m_uartReadQueue.size() < MAX_READ_QUEUE_SIZE))
-		{
-			m_uartReadQueue.push_back(UART_ACK);
-		}
-		if(ShouldLogUartCommand())
-		{
-			CardLog( "  command 0x%02X is not in the reply file: %s\r\n",
-			                         static_cast<uint32>(unknownCommand), m_syntheticReply.empty() ? "no reply" : "synthetic reply");
-		}
-		return;
-	}
-	m_useSyntheticReply = false;
-
-	m_uartSelectedCommand = entryIndex;
-	m_uartSelectedReplyIndex = 0;
-	m_uartCommandSearchStart = (entryIndex + 1) % m_uartCommands.size();
-
-	if(m_uartCommands[entryIndex].hasAck && (m_uartReadQueue.size() < MAX_READ_QUEUE_SIZE))
+	//The modelled reader does not know this command. Answer it like a real reader would,
+	//otherwise the game never gets an acknowledge or a reply and reports an error. This
+	//happens for the commands that are only used while dispensing a card.
+	uint8 unknownCommand = (size > 2) ? command[2] : 0;
+	m_useSyntheticReply = true;
+	m_syntheticReply = BuildSyntheticCardReply(unknownCommand);
+	//Acknowledge every complete frame, even when no reply is known for it: a real reader
+	//does that too, and the game would otherwise wait for the acknowledge forever.
+	bool isCompleteFrame = (size >= 8) && (command[0] == 0x02) && (command[1] == (size - 2));
+	if(isCompleteFrame && (m_uartReadQueue.size() < MAX_READ_QUEUE_SIZE))
 	{
 		m_uartReadQueue.push_back(UART_ACK);
 	}
 	if(ShouldLogUartCommand())
 	{
-		CardLog( "  command matched entry #%d (%d reply frame(s))\r\n",
-		                         static_cast<int>(entryIndex), static_cast<int>(m_uartCommands[entryIndex].replies.size()));
+		CardLog("  command 0x%02X is not modelled: %s\r\n",
+		        static_cast<uint32>(unknownCommand), m_syntheticReply.empty() ? "no reply" : "synthetic reply");
 	}
 }
 
@@ -734,30 +562,6 @@ void CArcadeSpy::QueueUartReply()
 		return;
 	}
 
-	if(m_uartSelectedCommand >= m_uartCommands.size()) return;
-	const auto& entry = m_uartCommands[m_uartSelectedCommand];
-	if(entry.replies.empty()) return;
-
-	//Send the next reply of the current command, or send the last one again when the
-	//capture ran out of replies for it.
-	size_t replyIndex = m_uartSelectedReplyIndex;
-	if(replyIndex >= entry.replies.size())
-	{
-		replyIndex = entry.replies.size() - 1;
-	}
-	else
-	{
-		m_uartSelectedReplyIndex++;
-	}
-
-	std::vector<uint8> reply = entry.replies[replyIndex];
-	HandleCardReply(reply);
-	if((m_uartReadQueue.size() + reply.size()) > MAX_READ_QUEUE_SIZE) return;
-	m_uartReadQueue.insert(m_uartReadQueue.end(), reply.begin(), reply.end());
-	if(ShouldLogUartCommand())
-	{
-		LogCardReply(reply);
-	}
 }
 
 uint32 CArcadeSpy::ServeUartRead(uint32 bufferPtr, uint32 size)
@@ -786,7 +590,6 @@ uint32 CArcadeSpy::ServeUartRead(uint32 bufferPtr, uint32 size)
 
 	if(m_uartReadQueue.empty())
 	{
-		TryLoadUartReplyFile();
 		if(m_uartReadQueue.empty()) return 0;
 	}
 
@@ -849,67 +652,17 @@ void CArcadeSpy::OpenSerialPortIfConfigured()
 	if(m_serialPassthrough) return;
 #ifdef _WIN32
 	std::error_code errorCode;
-	if(!fs::exists(m_serialConfigPath, errorCode)) return;
 
-	std::string contents;
-	try
-	{
-		auto stream = Framework::CreateInputStdStream(m_serialConfigPath.native());
-		uint64 size = stream.GetLength();
-		contents.resize(static_cast<size_t>(size));
-		if(size != 0)
-		{
-			stream.Read(&contents[0], static_cast<uint32>(size));
-		}
-	}
-	catch(...)
-	{
-		CardLog("card: failed to read '%s', the reader is emulated\r\n", m_serialConfigPath.string().c_str());
-		return;
-	}
-
-	//First line is the port name, the second one an optional baud rate
-	std::string portName;
-	uint32 baudRate = 9600;
-	{
-		size_t lineStart = 0;
-		int lineIndex = 0;
-		while(lineStart <= contents.size())
-		{
-			size_t lineEnd = contents.find_first_of("\r\n", lineStart);
-			if(lineEnd == std::string::npos) lineEnd = contents.size();
-			std::string line = contents.substr(lineStart, lineEnd - lineStart);
-			while(!line.empty() && ((line.back() == ' ') || (line.back() == '\t'))) line.pop_back();
-			size_t firstCharacter = line.find_first_not_of(" \t");
-			if(firstCharacter != std::string::npos)
-			{
-				line = line.substr(firstCharacter);
-				if(lineIndex == 0)
-				{
-					portName = line;
-				}
-				else if(lineIndex == 1)
-				{
-					try
-					{
-						baudRate = static_cast<uint32>(std::stoul(line));
-					}
-					catch(...)
-					{
-					}
-				}
-				lineIndex++;
-			}
-			if(lineEnd >= contents.size()) break;
-			lineStart = lineEnd + 1;
-		}
-	}
-
+	//The port comes from the machine definition, there is no file to read
+	std::string portName = m_serialPort;
 	if(portName.empty())
 	{
-		CardLog("card: '%s' does not name a serial port, the reader is emulated\r\n", m_serialConfigPath.string().c_str());
+		CardLog("card: no serial port configured, the reader is emulated\r\n");
 		return;
 	}
+
+	//The card reader runs at a fixed speed on the cabinet side
+	const uint32 baudRate = 9600;
 
 	std::string deviceName = "\\\\.\\" + portName;
 	HANDLE handle = CreateFileA(deviceName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
@@ -996,13 +749,18 @@ void CArcadeSpy::ScanCards()
 	if(m_cardsScanned) return;
 	m_cardsScanned = true;
 
+	//The numbering does not have to be contiguous: a store holding card0, card3, card4 and
+	//card5 is normal, so gaps are skipped instead of ending the scan. The highest index that
+	//exists bounds the accepted ones, which keeps insert=N meaning cardN.pbm.
 	m_cardCount = 0;
 	for(size_t i = 0; i < 64; i++)
 	{
 		auto path = m_cardPath / string_format("card%d.pbm", static_cast<int>(i));
 		std::error_code errorCode;
-		if(!fs::exists(path, errorCode)) break;
-		m_cardCount++;
+		if(fs::exists(path, errorCode))
+		{
+			m_cardCount = i + 1;
+		}
 	}
 
 	CardLog( "card store: %d card(s) in '%s'\r\n",
@@ -1072,7 +830,44 @@ void CArcadeSpy::LoadCard(size_t index)
 		}
 	}
 
-	//The card data is hidden at the end of the image, behind a magic
+	//The card manager appends its data right after the image: a 16 bit data section
+	//holding the block count and the (id, size, data) entries, then a 16 bit text section.
+	if(!m_cardImage.empty() && ((trailerOffset + 2) <= contents.size()))
+	{
+		size_t offset = trailerOffset;
+		auto read16 = [&contents, &offset]() -> uint16
+		{
+			uint16 value = 0;
+			if((offset + 2) <= contents.size())
+			{
+				value = static_cast<uint16>(contents[offset]) | (static_cast<uint16>(contents[offset + 1]) << 8);
+				offset += 2;
+			}
+			return value;
+		};
+		uint16 dataSize = read16();
+		size_t dataEnd = offset + dataSize;
+		if((dataSize >= 2) && (dataEnd <= contents.size()))
+		{
+			uint16 blockCount = read16();
+			for(uint16 block = 0; block < blockCount; block++)
+			{
+				uint16 id = read16();
+				uint16 blockSize = read16();
+				if((offset + blockSize) > dataEnd) break;
+				m_cardBlocks[id] = std::vector<uint8>(contents.begin() + offset, contents.begin() + offset + blockSize);
+				offset += blockSize;
+			}
+			offset = dataEnd;
+			uint16 textSize = read16();
+			if((offset + textSize) <= contents.size())
+			{
+				m_cardTextFrames.assign(contents.begin() + offset, contents.begin() + offset + textSize);
+			}
+		}
+	}
+	
+	//Older cards keep their data behind a magic at the end of the image
 	for(size_t i = trailerOffset; (i + sizeof(CARD_FILE_MAGIC)) <= contents.size(); i++)
 	{
 		if(memcmp(contents.data() + i, CARD_FILE_MAGIC, sizeof(CARD_FILE_MAGIC)) != 0) continue;
@@ -1103,21 +898,39 @@ void CArcadeSpy::SaveCard()
 {
 	ScanCards();
 
-	bool cardWasPresent = (m_cardIndex < m_cardCount);
+	auto cardPathOf = [this](size_t index)
+	{
+		return m_cardPath / string_format("card%d.pbm", static_cast<int>(index));
+	};
+	//A card that came from the store keeps its identity: reading it and ejecting it writes
+	//back into the same file. A card the game dispensed was never loaded from the store, and that one is
+	//stored under the number take=N asked for, or under the highest number plus one.
+	std::error_code cardExistsError;
+	bool cardWasPresent = m_cardFromStore;
 	if(m_cardImage.empty() && m_cardBlocks.empty())
 	{
-		AdvanceCard();
 		return;
 	}
 
 	if(!cardWasPresent)
 	{
-		//A new card was dispensed: it becomes the next card of the store and the one that
-		//is presented to the game afterwards
-		m_cardIndex = m_cardCount;
+		size_t target = m_cardCount;
+		std::error_code targetError;
+		if((m_cardSaveAsIndex != CARD_NO_SAVE_TARGET) && !fs::exists(cardPathOf(m_cardSaveAsIndex), targetError))
+		{
+			target = m_cardSaveAsIndex;
+		}
+		else if(m_cardSaveAsIndex != CARD_NO_SAVE_TARGET)
+		{
+			CardLog("card %d already exists, the new card becomes card %d\r\n",
+			        static_cast<int>(m_cardSaveAsIndex), static_cast<int>(target));
+		}
+		m_cardIndex = target;
+		m_cardSaveAsIndex = CARD_NO_SAVE_TARGET;
+		if(m_cardIndex >= m_cardCount) m_cardCount = m_cardIndex + 1;
 	}
 
-	auto path = m_cardPath / string_format("card%d.pbm", static_cast<int>(m_cardIndex));
+	auto path = cardPathOf(m_cardIndex);
 
 	std::vector<uint8> fileData;
 
@@ -1143,16 +956,26 @@ void CArcadeSpy::SaveCard()
 	fileData.insert(fileData.end(), header.begin(), header.end());
 	fileData.insert(fileData.end(), image.begin(), image.end());
 
-	//Card data, hidden at the end of the image
-	fileData.insert(fileData.end(), CARD_FILE_MAGIC, CARD_FILE_MAGIC + sizeof(CARD_FILE_MAGIC));
-	AppendUint32(fileData, static_cast<uint32>(m_cardBlocks.size()));
+	//Card data right after the image, in the layout the card manager uses: a 16 bit data
+	//section holding the block count and the (id, size, data) entries, then a 16 bit text
+	//section. The older layout (the same data behind an IMSCARD1 magic with 32 bit fields)
+	//is still accepted when reading.
+	std::vector<uint8> dataSection;
+	auto append16 = [](std::vector<uint8>& data, uint16 value)
+	{
+		data.push_back(static_cast<uint8>(value & 0xFF));
+		data.push_back(static_cast<uint8>((value >> 8) & 0xFF));
+	};
+	append16(dataSection, static_cast<uint16>(m_cardBlocks.size()));
 	for(const auto& blockPair : m_cardBlocks)
 	{
-		AppendUint32(fileData, blockPair.first);
-		AppendUint32(fileData, static_cast<uint32>(blockPair.second.size()));
-		fileData.insert(fileData.end(), blockPair.second.begin(), blockPair.second.end());
+		append16(dataSection, static_cast<uint16>(blockPair.first));
+		append16(dataSection, static_cast<uint16>(blockPair.second.size()));
+		dataSection.insert(dataSection.end(), blockPair.second.begin(), blockPair.second.end());
 	}
-	AppendUint32(fileData, static_cast<uint32>(m_cardTextFrames.size()));
+	append16(fileData, static_cast<uint16>(dataSection.size()));
+	fileData.insert(fileData.end(), dataSection.begin(), dataSection.end());
+	append16(fileData, static_cast<uint16>(m_cardTextFrames.size()));
 	fileData.insert(fileData.end(), m_cardTextFrames.begin(), m_cardTextFrames.end());
 
 	try
@@ -1160,9 +983,10 @@ void CArcadeSpy::SaveCard()
 		Framework::PathUtils::EnsurePathExists(m_cardPath);
 		auto stream = Framework::CreateOutputStdStream(path.native());
 		stream.Write(fileData.data(), static_cast<uint32>(fileData.size()));
-		CardLog( "card %d saved: '%s' (%d bytes, %d data block(s), artwork %s)\r\n",
+		CardLog( "card %d saved: '%s' (%d bytes, %d data block(s), %d text byte(s), artwork %s)\r\n",
 		                         static_cast<int>(m_cardIndex), path.string().c_str(),
 		                         static_cast<int>(fileData.size()), static_cast<int>(m_cardBlocks.size()),
+		                         static_cast<int>(m_cardTextFrames.size()),
 		                         artworkSource);
 		if(!cardWasPresent)
 		{
@@ -1179,18 +1003,8 @@ void CArcadeSpy::SaveCard()
 	m_cardTextFrames.clear();
 	m_cardImagePrinted = false;
 
-	AdvanceCard();
-}
-
-void CArcadeSpy::AdvanceCard()
-{
-	ScanCards();
-	if(m_cardCount == 0) return;
-
-	//The game ejects a card, asks for another one and reads it again
-	m_cardIndex = (m_cardIndex + 1) % m_cardCount;
-	LoadCard(m_cardIndex);
-	CardLog( "card reader: card %d inserted\r\n", static_cast<int>(m_cardIndex));
+	//The card stays the current one: the next insert or take decides what comes next.
+	m_cardFromStore = false;
 }
 
 void CArcadeSpy::HandleCardRequest(const uint8* frame, uint32 size)
@@ -1332,8 +1146,20 @@ void CArcadeSpy::UpdateCardControl()
 	m_cardControlCheckCounter++;
 
 	std::error_code errorCode;
-	if(!fs::exists(m_cardControlPath, errorCode)) return;
+	if(!fs::exists(m_cardControlPath, errorCode))
+	{
+		return;
+	}
 	auto writeTime = fs::last_write_time(m_cardControlPath, errorCode);
+	//Diagnostic: commands are only acted upon when the timestamp changes, so a command
+	//that never shows up in the log means the file was never seen as changed.
+	{
+		static fs::file_time_type s_lastControlTime{};
+		if(writeTime != s_lastControlTime)
+		{
+			s_lastControlTime = writeTime;
+		}
+	}
 	if(errorCode) return;
 	if(m_cardControlLoaded && (writeTime == m_cardControlTime)) return;
 	m_cardControlLoaded = true;
@@ -1386,20 +1212,17 @@ void CArcadeSpy::UpdateCardControl()
 
 	if(actionApplied)
 	{
-		//Action commands only apply once: the file is rewritten with the settings alone, so
-		//that a later change of the settings cannot replay a card movement.
+		//A command applies once: the file goes back to manual so that nothing can replay a
+		//card movement, and so that only what is written afterwards is acted upon.
 		try
 		{
-			std::string settings = string_format("%s slot=%d dispenser=%d",
-			                                     m_cardAuto ? "auto" : "manual",
-			                                     static_cast<int>(m_cardSlotTakePolls),
-			                                     static_cast<int>(m_cardDispenserCards));
+			std::string initialCommand = "manual";
 			auto stream = Framework::CreateOutputStdStream(m_cardControlPath.native());
-			stream.Write(settings.data(), static_cast<uint32>(settings.size()));
-			CardLog("card: control file reset (%s)\r\n", settings.c_str());
+			stream.Write(initialCommand.data(), static_cast<uint32>(initialCommand.size()));
 		}
 		catch(...)
 		{
+			CardLog("failed to reset the card control file.\r\n");
 		}
 	}
 }
@@ -1414,8 +1237,8 @@ void CArcadeSpy::ApplyCardControlCommand(const std::string& command)
 
 	if(token == "auto")
 	{
-		m_cardAuto = true;
-		CardLog( "card: automatic mode\r\n");
+		m_cardAuto = false;
+		CardLog( "card: automatic mode is gone, cards go in and out by hand\r\n");
 	}
 	else if(token == "manual")
 	{
@@ -1446,11 +1269,17 @@ void CArcadeSpy::ApplyCardControlCommand(const std::string& command)
 					CardLog("card: a card is already inside the reader, insert ignored\r\n");
 					return;
 				}
-				m_cardIndex = index;
-				LoadCard(m_cardIndex);
+				//The number only matters when the game dispenses a brand new card: it is stored as
+				//cardN.pbm then. A card that came from the store is written back to its own file.
+				m_cardSaveAsIndex = index;
 				//The player puts the card at the insertion slot and the reader takes it in when
 				//a command asks for it. Response 1 stays '0' (no card in the device) meanwhile,
 				//because '4' means a card left behind at the slot in the SDK.
+				m_cardFromStore = true;
+				//Remember which card is used and read its file, otherwise the reader answers with
+				//whatever it happens to hold.
+				m_cardIndex = index;
+				LoadCard(m_cardIndex);
 				m_cardPendingInsert = true;
 				CardLog("card: card %d at the insertion slot, waiting to be taken in\r\n", static_cast<int>(index));
 			}
@@ -1482,7 +1311,7 @@ void CArcadeSpy::ApplyCardControlCommand(const std::string& command)
 				{
 					m_cardIndex = index;
 					LoadCard(m_cardIndex);
-					CardLog("card: card %d selected, it is the next one to be inserted\r\n",
+					CardLog("card: a new card will be stored as card %d\r\n",
 					        static_cast<int>(index));
 				}
 				else
@@ -1659,7 +1488,7 @@ bool CArcadeSpy::HandleModelledCardCommand(const uint8* frame, uint32 size)
 	if(!ParseCardFrame(frame, size, command, blockId, &payload, payloadSize)) return false;
 
 	//Only the commands that were captured on a real reader are handled here, everything else
-	//keeps using the captured reply file
+	//keeps using the modelled reader
 	if((command != 0x10) && (command != 0x20) && (command != 0x33) && (command != 0x53) &&
 	   (command != 0x78) && (command != 0x7B) && (command != 0x7C) && (command != 0x80) &&
 	   (command != 0x90) && (command != 0xA0) && (command != 0xB0)) return false;

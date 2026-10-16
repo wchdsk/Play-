@@ -1,3 +1,4 @@
+
 #include "Log.h"
 #include <set>
 #include <cstdarg>
@@ -15,6 +16,9 @@
 static const std::set<std::string, std::less<>> g_allowedLogs =
 {
 	//"iop_mcserv",
+	//The card reader log is always produced: it is the only record of what the reader
+	//answered while a game runs.
+	"arcade_card",
 };
 // clang-format on
 

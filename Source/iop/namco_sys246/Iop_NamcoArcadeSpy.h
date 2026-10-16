@@ -16,14 +16,15 @@ namespace Iop
 		//Without this, import calls made by the games are silently dropped, which makes the
 		//games believe the arcade hardware (such as the card reader connected to the arcade
 		//serial port) is absent.
-		//For acuart, the device connected to the port (the card reader) is emulated from a
-		//capture of a real one: <Play! data path>/arcade_uart_reply.txt
+		//For acuart, the card reader connected to the port is modelled in code.
 		class CArcadeSpy : public CModule
 		{
 		public:
 			//With the internal reader disabled the card commands are only forwarded to the
 			//serial port, leaving the cards to the real hardware or an external manager.
 			void SetInternalCardReader(bool value) { m_internalCardReader = value; }
+			//Selects the serial port of the real card reader, see the "arcadeSerialPort" setting.
+			void SetSerialPort(const std::string& value) { m_serialPort = value; }
 			CArcadeSpy(std::string, uint8*);
 
 			std::string GetId() const override;
@@ -39,7 +40,6 @@ namespace Iop
 				bool hasAck = false;
 			};
 
-			bool TryLoadUartReplyFile();
 			void QueueUartCommand(const uint8* command, uint32 size);
 			void QueueUartReply();
 			bool ShouldLogUartCommand();
@@ -49,7 +49,6 @@ namespace Iop
 			void ScanCards();
 			void LoadCard(size_t);
 			void SaveCard();
-			void AdvanceCard();
 			void HandleCardRequest(const uint8*, uint32);
 			void HandleCardReply(std::vector<uint8>&);
 			std::vector<uint8> BuildSyntheticCardReply(uint8);
@@ -71,14 +70,7 @@ namespace Iop
 			uint32 m_uartSpeed = 9600;
 
 			//Card reader emulation state
-			fs::path m_uartReplyPath;
-			std::vector<UART_COMMAND_ENTRY> m_uartCommands;
-			size_t m_uartCommandSearchStart = 0;
-			size_t m_uartSelectedCommand = static_cast<size_t>(-1);
-			size_t m_uartSelectedReplyIndex = 0;
 			std::vector<uint8> m_uartReadQueue;
-			bool m_uartReplyFileLoaded = false;
-			fs::file_time_type m_uartReplyFileTime;
 			uint32 m_uartCommandLogCount = 0;
 
 			//Cards are stored as images (<Play! data path>/arcadecards/cardN.pbm) holding
@@ -87,6 +79,15 @@ namespace Iop
 			fs::path m_cardPath;
 			size_t m_cardCount = 0;
 			size_t m_cardIndex = 0;
+			//Card number a card that is dispensed by the game should be stored as, set by
+			//take=N. It is only used when the card in the reader did not come from the store, and
+			//it falls back to the highest number plus one when that card already exists.
+			static constexpr size_t CARD_NO_SAVE_TARGET = static_cast<size_t>(-1);
+			size_t m_cardSaveAsIndex = CARD_NO_SAVE_TARGET;
+			//Set while the card in the reader came from the store (insert=N or the advance after
+			//a read). A card the game dispensed itself leaves it clear, and that is what decides
+			//whether the card keeps its own file or gets a new number.
+			bool m_cardFromStore = false;
 			bool m_cardsScanned = false;
 			std::map<uint32, std::vector<uint8>> m_cardBlocks;
 			std::vector<uint8> m_cardImage;
@@ -109,11 +110,10 @@ namespace Iop
 			bool m_cardImagePrinted = false;
 			//Blank cards available in the dispenser of the cabinet
 			uint32 m_cardDispenserCards = 20;
-			//Optional pass through to a real card reader. <Play! data path>/arcade_serial.txt
-			//holds the name of the serial port on the first line (for instance "COM6") and an
-			//optional baud rate on the second one. When the file is missing or the port cannot
-			//be opened, the reader is emulated as usual.
-			fs::path m_serialConfigPath;
+			//Serial port of the real card reader, taken from the machine definition
+			//("arcadeSerialPort", for instance "COM6"). Empty means no port is opened and
+			//the reader is emulated as usual.
+			std::string m_serialPort;
 			//Shared by every instance of this class: the module that provides the arcade
 			//serial port is not necessarily the instance that opened the port
 			static bool m_serialPassthrough;
@@ -122,7 +122,7 @@ namespace Iop
 			uint32 ReadSerialPort(uint8*, uint32);
 			void WriteSerialPort(const uint8*, uint32);
 			//Cards are inserted and ejected by hand through <Play! data path>/arcade_card.txt
-			//("feed", "insert=N", "eject", "take", "dispenser=N", "slot=N", "auto", "manual")
+			//("feed", "insert=N", "eject", "take", "dispenser=N", "slot=N", "manual")
 			fs::path m_cardControlPath;
 			//When clear, the reader only forwards what it receives and lets the real hardware (or
 			//an external manager on the serial port) handle the card protocol.
@@ -133,7 +133,8 @@ namespace Iop
 			uint32 m_cardControlCheckCounter = 0;
 			//When automatic, the emulator feeds a card and takes it away by itself, otherwise
 			//every move of the card is made through the control file
-			bool m_cardAuto = true;
+			//Cards go in and out by hand: there is no automatic mode any more.
+			bool m_cardAuto = false;
 			//Number of polls an ejected card stays at the slot before being taken away
 			//automatically (0 disables it)
 			uint32 m_cardSlotTakePolls = 20;

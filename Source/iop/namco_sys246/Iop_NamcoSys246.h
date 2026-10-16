@@ -111,13 +111,10 @@ namespace Iop
 				//Number of switch polls needed to move the door by one position
 				DOOR_MOTOR_STEP_POLLS = 60,
 
-				//Default bits of the digital output holding the shutter motor. The games
-				//drive 0x60, where one bit is the shutter and the other one a cabinet light
-				//that stays on, so this has to be narrowed down (see arcade_door.txt).
-				DOOR_MOTOR_OUTPUT_MASK = 0x0060,
-
-				//How often (in switch polls) the door override file is checked for changes
-				DOOR_OVERRIDE_CHECK_POLLS = 32,
+				//Bit of the first JVS digital output that powers the shutter motor. The games drive
+				//0x60 for the pair of cabinet lamps (which stay on) and 0x70 while the door moves,
+				//so the motor is bit 4 - the fifth of the eight output LEDs on the real I/O board.
+				DOOR_MOTOR_OUTPUT_MASK = 0x0010,
 
 				//Switch bits the door position is reported on. These are the bits the default
 				//JVS button mapping puts DPAD_LEFT, CIRCLE and DPAD_RIGHT on.
@@ -125,19 +122,6 @@ namespace Iop
 				DOOR_SWITCH_BITS_CLOSED = 0x0008,
 				DOOR_SWITCH_BITS_MIDDLE = 0x0001,
 				DOOR_SWITCH_BITS_OPEN = 0x0004,
-			};
-
-			//Forces the reported door position, which allows to find out which position the
-			//game expects without rebuilding the emulator
-			//(<Play! data path>/arcade_door.txt, holding "auto", "none", "closed", "middle"
-			//or "open")
-			enum class DOOR_OVERRIDE
-			{
-				AUTO,
-				NONE,
-				CLOSED,
-				MIDDLE,
-				OPEN,
 			};
 
 			enum JVS_DRUM_CHANNELS
@@ -173,7 +157,6 @@ namespace Iop
 
 			void SetDoorMotorState(bool);
 			void TickDoor();
-			void UpdateDoorOverride();
 			uint16 GetDoorSwitchBits() const;
 
 			static fs::path GetArcadeSavePath();
@@ -229,20 +212,6 @@ namespace Iop
 			bool m_cardReaderShutter = true;
 			uint32 m_doorPollCounter = 0;
 			bool m_doorMotorOn = false;
-			std::string m_lastDoorOutputDump;
-
-			DOOR_OVERRIDE m_doorOverride = DOOR_OVERRIDE::AUTO;
-			uint32 m_doorMotorMask = DOOR_MOTOR_OUTPUT_MASK;
-			uint32 m_doorStepPolls = DOOR_MOTOR_STEP_POLLS;
-			uint32 m_doorOverrideCheckCounter = 0;
-			//The sensor bits can be forced from the configuration file ("bits=0xNNNN"): the
-			//cabinet hardware is not always available and trying the combinations is the only
-			//way to find out which one makes a game go on.
-			bool m_doorBitsForced = false;
-			uint32 m_doorBitsValue = 0;
-			bool m_doorOverrideFileLoaded = false;
-			bool m_doorConfigLogged = false;
-			fs::file_time_type m_doorOverrideFileTime;
 
 			//Diagnostics for the arcade I/O command traffic. The last packets seen are kept
 			//as raw bytes so that change detection stays cheap on the polling path.

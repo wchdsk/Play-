@@ -568,16 +568,7 @@ void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 				}
 			}
 
-			//The shutter motor of the card reader is driven by one of the digital outputs
-			//(the games drive 0x60, which also holds a cabinet light that stays on)
-			SetDoorMotorState((firstOutputByte & m_doorMotorMask) != 0);
-			if(outputDump != m_lastDoorOutputDump)
-			{
-				m_lastDoorOutputDump = outputDump;
-				ArcadeLog( "JVS digital output: %s(door motor %s)\r\n",
-				                         outputDump.c_str(), m_doorMotorOn ? "on" : "off");
-			}
-
+			SetDoorMotorState((firstOutputByte & DOOR_MOTOR_OUTPUT_MASK) != 0);
 			(*output++) = 0x01; //Command success
 			(*dstSize) += 1;
 		}
@@ -772,29 +763,13 @@ void CSys246::TickDoor()
 {
 	if(!m_cardReaderShutter) return;
 
-	UpdateDoorOverride();
 
 	//The door position can be forced from a file, which makes it possible to find out
 	//which position the game expects without rebuilding the emulator
-	switch(m_doorOverride)
-	{
-	case DOOR_OVERRIDE::CLOSED:
-		m_doorState = DOOR_STATE_CLOSED;
-		return;
-	case DOOR_OVERRIDE::MIDDLE:
-		m_doorState = DOOR_STATE_MIDDLE_A;
-		return;
-	case DOOR_OVERRIDE::OPEN:
-		m_doorState = DOOR_STATE_OPEN;
-		return;
-	default:
-		break;
-	}
-
 	if(!m_doorMotorOn) return;
 
 	m_doorPollCounter++;
-	if(m_doorPollCounter < m_doorStepPolls) return;
+	if(m_doorPollCounter < DOOR_MOTOR_STEP_POLLS) return;
 	m_doorPollCounter = 0;
 
 	m_doorState = (m_doorState + 1) % DOOR_STATE_COUNT;
@@ -832,151 +807,6 @@ namespace
 	}
 }
 
-void CSys246::UpdateDoorOverride()
-{
-	m_doorOverrideCheckCounter++;
-	if(m_doorOverrideFileLoaded && ((m_doorOverrideCheckCounter % DOOR_OVERRIDE_CHECK_POLLS) != 0)) return;
-
-	auto configPath = CAppConfig::GetInstance().GetBasePath() / "arcade_door.txt";
-	std::error_code errorCode;
-	if(!fs::exists(configPath, errorCode)) return;
-	auto writeTime = fs::last_write_time(configPath, errorCode);
-	if(errorCode) return;
-	if(m_doorOverrideFileLoaded && (writeTime == m_doorOverrideFileTime)) return;
-	m_doorOverrideFileLoaded = true;
-	m_doorOverrideFileTime = writeTime;
-
-	std::string contents;
-	try
-	{
-		auto stream = Framework::CreateInputStdStream(configPath.native());
-		uint64 size = stream.GetLength();
-		contents.resize(static_cast<size_t>(size));
-		if(size != 0)
-		{
-			stream.Read(&contents[0], static_cast<uint32>(size));
-		}
-	}
-	catch(...)
-	{
-		ArcadeLog( "Failed to read the door configuration file.\r\n");
-		return;
-	}
-
-	DOOR_OVERRIDE doorOverride = DOOR_OVERRIDE::AUTO;
-	uint32 motorMask = DOOR_MOTOR_OUTPUT_MASK;
-	uint32 stepPolls = DOOR_MOTOR_STEP_POLLS;
-	bool bitsForced = false;
-	uint32 bitsValue = 0;
-
-	//The file holds a list of tokens: "auto", "none", "closed", "middle" or "open" to
-	//force the position, "motor=0x60" to select the digital output bit(s) driving the
-	//motor and "step=60" to set how many switch polls one position step takes.
-	std::string token;
-	auto flushToken = [&]() {
-		if(token.empty()) return;
-		for(char& character : token)
-		{
-			if((character >= 'A') && (character <= 'Z')) character = character - 'A' + 'a';
-		}
-
-		if(token == "auto")
-		{
-			doorOverride = DOOR_OVERRIDE::AUTO;
-		}
-		else if((token == "none") || (token == "off"))
-		{
-			doorOverride = DOOR_OVERRIDE::NONE;
-		}
-		else if(token == "open")
-		{
-			doorOverride = DOOR_OVERRIDE::OPEN;
-		}
-		else if((token == "middle") || (token == "mid"))
-		{
-			doorOverride = DOOR_OVERRIDE::MIDDLE;
-		}
-		else if((token == "closed") || (token == "close"))
-		{
-			doorOverride = DOOR_OVERRIDE::CLOSED;
-		}
-		else if(token.find("bits=") == 0)
-		{
-			//Forces the sensor bits as they are: "bits=0x0005" makes the middle and the open
-			//sensors active at the same time, which no position of the mechanism produces.
-			//Anything that is not a number ("bits=auto") gives the control back to the state.
-			uint32 value = 0;
-			if(ParseUint(token.substr(5), value))
-			{
-				bitsForced = true;
-				bitsValue = value & 0xFFFF;
-			}
-		}
-		else if(token.find("motor=") == 0)
-		{
-			uint32 value = 0;
-			if(ParseUint(token.substr(6), value)) motorMask = value & 0xFF;
-		}
-		else if(token.find("step=") == 0)
-		{
-			uint32 value = 0;
-			if(ParseUint(token.substr(5), value)) stepPolls = (value < 1) ? 1 : value;
-		}
-		token.clear();
-	};
-
-	for(size_t i = 0; i < contents.size(); i++)
-	{
-		char character = contents[i];
-		if(character == '#')
-		{
-			while((i < contents.size()) && (contents[i] != '\n')) i++;
-			flushToken();
-			continue;
-		}
-		if((character == ' ') || (character == '\t') || (character == '\r') || (character == '\n') || (character == ','))
-		{
-			flushToken();
-			continue;
-		}
-		token += character;
-	}
-	flushToken();
-
-	bool firstLoad = !m_doorConfigLogged;
-	m_doorConfigLogged = true;
-	if(firstLoad || (doorOverride != m_doorOverride) || (motorMask != m_doorMotorMask) ||
-	   (stepPolls != m_doorStepPolls) || (bitsForced != m_doorBitsForced) || (bitsValue != m_doorBitsValue))
-	{
-		m_doorOverride = doorOverride;
-		m_doorMotorMask = motorMask;
-		m_doorStepPolls = stepPolls;
-		m_doorBitsForced = bitsForced;
-		m_doorBitsValue = bitsValue;
-
-		const char* overrideName = "auto";
-		switch(m_doorOverride)
-		{
-		case DOOR_OVERRIDE::NONE:
-			overrideName = "none";
-			break;
-		case DOOR_OVERRIDE::CLOSED:
-			overrideName = "closed";
-			break;
-		case DOOR_OVERRIDE::MIDDLE:
-			overrideName = "middle";
-			break;
-		case DOOR_OVERRIDE::OPEN:
-			overrideName = "open";
-			break;
-		default:
-			break;
-		}
-		ArcadeLog( "Door config: position = %s, motor mask = 0x%02X, step = %d poll(s)\r\n",
-		                         overrideName, m_doorMotorMask, static_cast<int>(m_doorStepPolls));
-	}
-}
-
 uint16 CSys246::GetDoorSwitchBits() const
 {
 	//Shutter emulation disabled: report the door as open so nothing blocks on it.
@@ -984,10 +814,8 @@ uint16 CSys246::GetDoorSwitchBits() const
 
 	//The bits can be forced from the configuration file, which allows combinations that no
 	//position of the mechanism produces to be tried out
-	if(m_doorBitsForced) return static_cast<uint16>(m_doorBitsValue & 0xFFFF);
 
 	//No sensor active at all
-	if(m_doorOverride == DOOR_OVERRIDE::NONE) return 0;
 
 	switch(m_doorState)
 	{
