@@ -1,3 +1,17 @@
+# NOTICE #
+这个版本包含对[SYSTEM246][NM00022]The iDOLM@STER/偶像大师 游戏的如下支持
+  -修复SYSTEM246 ACUART的功能，支持打开windows本地串口，连接虚拟卡片管理器或者实机读卡器
+  -模式实际机台读卡器挡板的光电传感器
+  -修复Play！贴图拆分渲染时边缘缺陷
+  -修复Play! 2D/3D混合场景的渲染Z轴解析问题导致的图像缺失问题
+
+本版本也包含虚拟卡片管理器，功能如下
+  -支持发卡，读卡，写卡，打印等功能
+  -实时查看游戏打印的卡面内容
+  #由于模拟器限制需要VSPD等工具创建虚拟串口对使用
+
+详见commit
+
 # Play! #
 Play! is a PlayStation2 emulator for Windows, macOS, UNIX, Android, iOS & web browser platforms.
 
