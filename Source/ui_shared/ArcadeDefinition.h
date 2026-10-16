@@ -53,6 +53,9 @@ struct ARCADE_MACHINE_DEF
 	INPUT_MODE inputMode = INPUT_MODE::DEFAULT;
 	IO_MODE ioMode = IO_MODE::DEFAULT;
 	std::string boardId;
+	//Name of the serial port the arcade card reader is attached to (for example
+	//"COM6"). Empty means no port is opened and the reader is emulated internally.
+	std::string arcadeSerialPort;
 	std::optional<IlinkId> ilinkId;
 	std::array<float, 4> screenPosXform = {65535, 0, 65535, 0};
 	uint32 eeFreqScaleNumerator = 1;

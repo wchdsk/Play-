@@ -16,6 +16,7 @@
 #include "iop/namco_sys246/Iop_NamcoAcCdvd.h"
 #include "iop/namco_sys246/Iop_NamcoAcAta.h"
 #include "iop/namco_sys246/Iop_NamcoAcRam.h"
+#include "iop/namco_sys246/Iop_NamcoArcadeSpy.h"
 #include "iop/namco_sys246/Iop_NamcoPadMan.h"
 
 void CNamcoSys246Driver::PrepareEnvironment(CPS2VM* virtualMachine, const ARCADE_MACHINE_DEF& def)
@@ -140,6 +141,32 @@ void CNamcoSys246Driver::PrepareEnvironment(CPS2VM* virtualMachine, const ARCADE
 			if(!def.boardId.empty())
 			{
 				namcoArcadeModule->SetBoardId(def.boardId);
+			}
+		}
+
+		//The SYS2x6 BIOS provides a set of arcade IOP modules (acdev, acuart, acjv, ...) that
+		//Play! doesn't implement. Import calls made by the games to those modules are silently
+		//dropped, which makes the games believe the arcade hardware is absent (for example,
+		//the card reader connected to the arcade serial port reports as "not connected").
+		//Register logging stubs so those calls become visible in the log.
+		//RegisterModule fails if a module with the same id is already registered.
+		{
+			static const char* arcadeModuleIds[] =
+			{
+				"acdev",
+				"acuart",
+				"acjv",
+				"accore",
+				"ssbusc",
+				"acmem",
+				"acflash",
+				"acsram",
+				"acrtc",
+				"actimer",
+			};
+			for(const char* arcadeModuleId : arcadeModuleIds)
+			{
+				iopBios->RegisterModule(std::make_shared<Iop::Namco::CArcadeSpy>(arcadeModuleId, virtualMachine->m_iop->m_ram));
 			}
 		}
 	}

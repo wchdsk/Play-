@@ -365,6 +365,8 @@ set(COMMON_SRC_FILES
 	iop/namco_sys246/Iop_NamcoAcCdvd.h
 	iop/namco_sys246/Iop_NamcoAcRam.cpp
 	iop/namco_sys246/Iop_NamcoAcRam.h
+	iop/namco_sys246/Iop_NamcoArcadeSpy.cpp
+	iop/namco_sys246/Iop_NamcoArcadeSpy.h
 	iop/namco_sys246/Iop_NamcoPadMan.cpp
 	iop/namco_sys246/Iop_NamcoPadMan.h
 	iop/namco_sys246/Iop_NamcoSys246.cpp

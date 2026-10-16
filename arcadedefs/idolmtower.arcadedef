@@ -11,6 +11,8 @@
 		"name": "NM00022 IDM1-HA (HDD).chd"
 	},
 	"inputMode": "touch",
+	"boardId": "namco ltd.;FCB;Ver1.02;JPN,TouchPanel&Multipurpose",
+	"arcadeSerialPort": "",
 	"screenPosXform": [ 65535, 0, -65535, 0 ],
 	"eeFrequencyScale": [4, 3],
 	"boot": "ac0:IDLLOAD",

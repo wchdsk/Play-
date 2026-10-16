@@ -226,6 +226,10 @@ ARCADE_MACHINE_DEF ReadArcadeMachineDefinition(const fs::path& arcadeDefPath)
 	{
 		def.boardId = defJson["boardId"];
 	}
+	if(defJson.contains("arcadeSerialPort"))
+	{
+		def.arcadeSerialPort = defJson["arcadeSerialPort"];
+	}
 	if(defJson.contains("screenPosXform"))
 	{
 		auto screenPosXformArray = defJson["screenPosXform"];

@@ -1,10 +1,12 @@
 #include "Iop_NamcoSys246.h"
 #include <cstring>
+#include "string_format.h"
 #include "StdStreamUtils.h"
 #include "zip/ZipArchiveReader.h"
 #include "zip/ZipArchiveWriter.h"
 #include "AppConfig.h"
 #include "Log.h"
+#include "Iop_NamcoArcadeLog.h"
 #include "states/RegisterStateFile.h"
 #include "PathUtils.h"
 #include "iop/Iop_SifCmd.h"
@@ -18,6 +20,24 @@ using namespace Iop::Namco;
 #define STATE_FILE ("iop_namcoarcade/state.xml")
 #define STATE_RECV_ADDR ("recvAddr")
 #define STATE_SEND_ADDR ("sendAddr")
+
+namespace
+{
+	//Dumps a byte buffer as hex. Used to trace the arcade serial port (acuart) traffic.
+	std::string FormatHexDump(const uint8* data, uint32 size, uint32 maxBytes = 0x100)
+	{
+		uint32 dumpSize = (size > maxBytes) ? maxBytes : size;
+		std::string result;
+		for(uint32 i = 0; i < dumpSize; i++)
+		{
+			if(i != 0) result += ((i % 16) == 0) ? "\r\n      " : " ";
+			result += string_format("%02X", static_cast<uint32>(data[i]));
+		}
+		if(dumpSize < size) result += string_format(" ... (%d more bytes)", static_cast<int>(size - dumpSize));
+		if(result.empty()) result = "(no data)";
+		return result;
+	}
+}
 
 //Ref: http://daifukkat.su/files/jvs_wip.pdf
 enum
@@ -140,6 +160,7 @@ void CSys246::Invoke(CMIPS& context, unsigned int functionId)
 
 void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 {
+	const uint8* packetStart = input;
 	assert(*input == JVS_SYNC);
 	input++;
 	uint8 inDest = *input++;
@@ -147,6 +168,24 @@ void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 	FRAMEWORK_MAYBE_UNUSED uint8 outSize = 0;
 	FRAMEWORK_MAYBE_UNUSED uint32 inWorkChecksum = inDest + inSize;
 	inSize--;
+
+	//Log the request sent by the game. An entry is only produced when the contents of the
+	//packet change and the comparison is done on the raw bytes, because the games poll the
+	//switch inputs dozens of times per second and building a dump for every poll is costly.
+	{
+		uint32 requestSize = static_cast<uint32>(inSize) + 4;
+		bool requestChanged = (requestSize != m_lastJvsRequestRaw.size()) ||
+		                      (memcmp(m_lastJvsRequestRaw.data(), packetStart, requestSize) != 0);
+		if(requestChanged)
+		{
+			m_lastJvsRequestRaw.assign(reinterpret_cast<const char*>(packetStart), requestSize);
+			if((m_jvsRequestDumpCount < 16) || ((m_jvsRequestDumpCount % 256) == 0))
+			{
+				ArcadeLog( "JVS request: %s\r\n", FormatHexDump(packetStart, requestSize, 0x40).c_str());
+			}
+			m_jvsRequestDumpCount++;
+		}
+	}
 
 	(*output++) = JVS_SYNC;
 	(*output++) = 0x00; //Master ID?
@@ -283,7 +322,17 @@ void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 				(*output++) = 0x10; //Y pos bits
 				(*output++) = 0x01; //channels
 
-				(*dstSize) += 4;
+				//GPIO output. The card reader shutter motor of iDOLM@STER is driven by the
+				//5th of the 8 outputs of the I/O board, so the game needs to know outputs
+				//are available, otherwise it reports a shutter error without even trying
+				//to move it. Count and format are taken from the real FCB board
+				//("namco ltd.;FCB;Ver1.02;JPN,TouchPanel&Multipurpose").
+				(*output++) = 0x12; //GPIO output
+				(*output++) = 0x06; //slot(?) count
+				(*output++) = 0x00;
+				(*output++) = 0x00;
+
+				(*dstSize) += 8;
 			}
 
 			(*output++) = 0x00; //End of features
@@ -330,9 +379,14 @@ void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 			}
 			(*output++) = m_testButtonState;
 
+			//Card reader door: move it while its motor is powered and report its position on
+			//the switch inputs, so that the game can stop the motor on the wanted position.
+			TickDoor();
+			uint16 buttonState = (m_jvsButtonState[0] & ~DOOR_SWITCH_BITS_MASK) | GetDoorSwitchBits();
+
 			//(*output++) = (m_jvsSystemButtonState == 0x03) ? 0x80 : 0;  //Test
-			(*output++) = static_cast<uint8>(m_jvsButtonState[0]);      //Player 1
-			(*output++) = static_cast<uint8>(m_jvsButtonState[0] >> 8); //Player 1
+			(*output++) = static_cast<uint8>(buttonState);      //Player 1
+			(*output++) = static_cast<uint8>(buttonState >> 8); //Player 1
 			(*dstSize) += 4;
 
 			if(playerCount == 2)
@@ -483,14 +537,25 @@ void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 			inWorkChecksum += bytecount;
 			inSize--;
 
+			std::string outputDump;
+			uint8 firstOutputByte = 0;
+
 			for(int i = 1; i <= bytecount; i++)
 			{
 				uint8 gpvalue = (*input++);
-				inWorkChecksum += gpvalue;
 				inSize--;
+
+				//Note: the output data is deliberately not added to the running checksum.
+				//Games compute the checksum of the output command without its payload
+				//(verified against packets captured from a real System 246), so adding it
+				//here makes the packet checksum verification below fail.
+
+				outputDump += string_format("%02X ", gpvalue);
 
 				if(i == 1)
 				{
+					firstOutputByte = gpvalue;
+
 					// value1 0xC0 indicates P1 recoil triggered
 					int p1Recoil = (gpvalue >= 0x50) ? 1 : 0;
 					if(p1Recoil != m_p1RecoilLast)
@@ -503,18 +568,45 @@ void CSys246::ProcessJvsPacket(const uint8* input, uint8* output)
 				}
 			}
 
+			//The shutter motor of the card reader is driven by one of the digital outputs
+			//(the games drive 0x60, which also holds a cabinet light that stays on)
+			SetDoorMotorState((firstOutputByte & m_doorMotorMask) != 0);
+			if(outputDump != m_lastDoorOutputDump)
+			{
+				m_lastDoorOutputDump = outputDump;
+				ArcadeLog( "JVS digital output: %s(door motor %s)\r\n",
+				                         outputDump.c_str(), m_doorMotorOn ? "on" : "off");
+			}
+
 			(*output++) = 0x01; //Command success
 			(*dstSize) += 1;
 		}
 		break;
 		default:
-			//Unknown command
-			assert(false);
+			//Unknown command: report it to the master like a real I/O board does instead of
+			//crashing the emulator
+			m_unknownJvsCommandCount++;
+			if((m_unknownJvsCommandCount <= 16) || ((m_unknownJvsCommandCount % 256) == 0))
+			{
+				ArcadeLog( "Unknown JVS command (0x%02X).\r\n", cmd);
+			}
+			(*output++) = 0x02; //Unknown command
+			(*dstSize)++;
 			break;
 		}
 	}
-	FRAMEWORK_MAYBE_UNUSED uint8 inChecksum = (*input);
-	assert(inChecksum == (inWorkChecksum & 0xFF));
+	uint8 inChecksum = (*input);
+	if(inChecksum != (inWorkChecksum & 0xFF))
+	{
+		//Some games compute the checksum of a request without the payload of its output
+		//command, so a mismatch is only reported instead of being fatal.
+		m_jvsChecksumErrorCount++;
+		if((m_jvsChecksumErrorCount <= 16) || ((m_jvsChecksumErrorCount % 256) == 0))
+		{
+			ArcadeLog( "JVS request checksum mismatch (0x%02X, expected 0x%02X).\r\n",
+			                         inChecksum, inWorkChecksum & 0xFF);
+		}
+	}
 }
 
 void CSys246::SaveState(Framework::CZipArchiveWriter& archive) const
@@ -623,7 +715,7 @@ void CSys246::SetButtonState(unsigned int padNumber, PS2::CControllerInfo::BUTTO
 			uint16 pktId3 = sendData[0x08];
 			if(pktId != 0)
 			{
-				CLog::GetInstance().Warn(LOG_NAME, "PktId: 0x%04X\r\n", pktId);
+				ArcadeLog( "PktId: 0x%04X\r\n", pktId);
 				if(reinterpret_cast<const uint8*>(sendData)[0x122] == JVS_SYNC)
 				{
 					ProcessJvsPacket(reinterpret_cast<const uint8*>(sendData) + 0x122, reinterpret_cast<uint8*>(recvData) + 0x15A);
@@ -664,6 +756,245 @@ void CSys246::SetAxisState(unsigned int padNumber, PS2::CControllerInfo::BUTTON 
 		break;
 	default:
 		break;
+	}
+}
+
+void CSys246::SetDoorMotorState(bool on)
+{
+	if(m_doorMotorOn == on) return;
+	m_doorMotorOn = on;
+	m_doorPollCounter = 0;
+	ArcadeLog( "Door motor %s (door state = %d)\r\n",
+	                         on ? "on" : "off", static_cast<int>(m_doorState));
+}
+
+void CSys246::TickDoor()
+{
+	UpdateDoorOverride();
+
+	//The door position can be forced from a file, which makes it possible to find out
+	//which position the game expects without rebuilding the emulator
+	switch(m_doorOverride)
+	{
+	case DOOR_OVERRIDE::CLOSED:
+		m_doorState = DOOR_STATE_CLOSED;
+		return;
+	case DOOR_OVERRIDE::MIDDLE:
+		m_doorState = DOOR_STATE_MIDDLE_A;
+		return;
+	case DOOR_OVERRIDE::OPEN:
+		m_doorState = DOOR_STATE_OPEN;
+		return;
+	default:
+		break;
+	}
+
+	if(!m_doorMotorOn) return;
+
+	m_doorPollCounter++;
+	if(m_doorPollCounter < m_doorStepPolls) return;
+	m_doorPollCounter = 0;
+
+	m_doorState = (m_doorState + 1) % DOOR_STATE_COUNT;
+	ArcadeLog( "Door moved to state %d\r\n", static_cast<int>(m_doorState));
+}
+
+namespace
+{
+	bool ParseUint(const std::string& text, uint32& value)
+	{
+		if(text.empty()) return false;
+
+		uint32 base = 10;
+		size_t offset = 0;
+		if((text.size() > 2) && (text[0] == '0') && ((text[1] == 'x') || (text[1] == 'X')))
+		{
+			base = 16;
+			offset = 2;
+		}
+
+		uint32 result = 0;
+		for(size_t i = offset; i < text.size(); i++)
+		{
+			char character = text[i];
+			uint32 digit = 0;
+			if((character >= '0') && (character <= '9')) digit = character - '0';
+			else if((character >= 'a') && (character <= 'f')) digit = character - 'a' + 10;
+			else if((character >= 'A') && (character <= 'F')) digit = character - 'A' + 10;
+			else return false;
+			if(digit >= base) return false;
+			result = (result * base) + digit;
+		}
+		value = result;
+		return true;
+	}
+}
+
+void CSys246::UpdateDoorOverride()
+{
+	m_doorOverrideCheckCounter++;
+	if(m_doorOverrideFileLoaded && ((m_doorOverrideCheckCounter % DOOR_OVERRIDE_CHECK_POLLS) != 0)) return;
+
+	auto configPath = CAppConfig::GetInstance().GetBasePath() / "arcade_door.txt";
+	std::error_code errorCode;
+	if(!fs::exists(configPath, errorCode)) return;
+	auto writeTime = fs::last_write_time(configPath, errorCode);
+	if(errorCode) return;
+	if(m_doorOverrideFileLoaded && (writeTime == m_doorOverrideFileTime)) return;
+	m_doorOverrideFileLoaded = true;
+	m_doorOverrideFileTime = writeTime;
+
+	std::string contents;
+	try
+	{
+		auto stream = Framework::CreateInputStdStream(configPath.native());
+		uint64 size = stream.GetLength();
+		contents.resize(static_cast<size_t>(size));
+		if(size != 0)
+		{
+			stream.Read(&contents[0], static_cast<uint32>(size));
+		}
+	}
+	catch(...)
+	{
+		ArcadeLog( "Failed to read the door configuration file.\r\n");
+		return;
+	}
+
+	DOOR_OVERRIDE doorOverride = DOOR_OVERRIDE::AUTO;
+	uint32 motorMask = DOOR_MOTOR_OUTPUT_MASK;
+	uint32 stepPolls = DOOR_MOTOR_STEP_POLLS;
+	bool bitsForced = false;
+	uint32 bitsValue = 0;
+
+	//The file holds a list of tokens: "auto", "none", "closed", "middle" or "open" to
+	//force the position, "motor=0x60" to select the digital output bit(s) driving the
+	//motor and "step=60" to set how many switch polls one position step takes.
+	std::string token;
+	auto flushToken = [&]() {
+		if(token.empty()) return;
+		for(char& character : token)
+		{
+			if((character >= 'A') && (character <= 'Z')) character = character - 'A' + 'a';
+		}
+
+		if(token == "auto")
+		{
+			doorOverride = DOOR_OVERRIDE::AUTO;
+		}
+		else if((token == "none") || (token == "off"))
+		{
+			doorOverride = DOOR_OVERRIDE::NONE;
+		}
+		else if(token == "open")
+		{
+			doorOverride = DOOR_OVERRIDE::OPEN;
+		}
+		else if((token == "middle") || (token == "mid"))
+		{
+			doorOverride = DOOR_OVERRIDE::MIDDLE;
+		}
+		else if((token == "closed") || (token == "close"))
+		{
+			doorOverride = DOOR_OVERRIDE::CLOSED;
+		}
+		else if(token.find("bits=") == 0)
+		{
+			//Forces the sensor bits as they are: "bits=0x0005" makes the middle and the open
+			//sensors active at the same time, which no position of the mechanism produces.
+			//Anything that is not a number ("bits=auto") gives the control back to the state.
+			uint32 value = 0;
+			if(ParseUint(token.substr(5), value))
+			{
+				bitsForced = true;
+				bitsValue = value & 0xFFFF;
+			}
+		}
+		else if(token.find("motor=") == 0)
+		{
+			uint32 value = 0;
+			if(ParseUint(token.substr(6), value)) motorMask = value & 0xFF;
+		}
+		else if(token.find("step=") == 0)
+		{
+			uint32 value = 0;
+			if(ParseUint(token.substr(5), value)) stepPolls = (value < 1) ? 1 : value;
+		}
+		token.clear();
+	};
+
+	for(size_t i = 0; i < contents.size(); i++)
+	{
+		char character = contents[i];
+		if(character == '#')
+		{
+			while((i < contents.size()) && (contents[i] != '\n')) i++;
+			flushToken();
+			continue;
+		}
+		if((character == ' ') || (character == '\t') || (character == '\r') || (character == '\n') || (character == ','))
+		{
+			flushToken();
+			continue;
+		}
+		token += character;
+	}
+	flushToken();
+
+	bool firstLoad = !m_doorConfigLogged;
+	m_doorConfigLogged = true;
+	if(firstLoad || (doorOverride != m_doorOverride) || (motorMask != m_doorMotorMask) ||
+	   (stepPolls != m_doorStepPolls) || (bitsForced != m_doorBitsForced) || (bitsValue != m_doorBitsValue))
+	{
+		m_doorOverride = doorOverride;
+		m_doorMotorMask = motorMask;
+		m_doorStepPolls = stepPolls;
+		m_doorBitsForced = bitsForced;
+		m_doorBitsValue = bitsValue;
+
+		const char* overrideName = "auto";
+		switch(m_doorOverride)
+		{
+		case DOOR_OVERRIDE::NONE:
+			overrideName = "none";
+			break;
+		case DOOR_OVERRIDE::CLOSED:
+			overrideName = "closed";
+			break;
+		case DOOR_OVERRIDE::MIDDLE:
+			overrideName = "middle";
+			break;
+		case DOOR_OVERRIDE::OPEN:
+			overrideName = "open";
+			break;
+		default:
+			break;
+		}
+		ArcadeLog( "Door config: position = %s, motor mask = 0x%02X, step = %d poll(s)\r\n",
+		                         overrideName, m_doorMotorMask, static_cast<int>(m_doorStepPolls));
+	}
+}
+
+uint16 CSys246::GetDoorSwitchBits() const
+{
+	//The bits can be forced from the configuration file, which allows combinations that no
+	//position of the mechanism produces to be tried out
+	if(m_doorBitsForced) return static_cast<uint16>(m_doorBitsValue & 0xFFFF);
+
+	//No sensor active at all
+	if(m_doorOverride == DOOR_OVERRIDE::NONE) return 0;
+
+	switch(m_doorState)
+	{
+	case DOOR_STATE_MIDDLE_A:
+	case DOOR_STATE_MIDDLE_B:
+		return DOOR_SWITCH_BITS_MIDDLE;
+	case DOOR_STATE_OPEN:
+		//The open position reports the middle sensor together with the open one, which is the
+		//combination the games wait for before they use the card slot
+		return DOOR_SWITCH_BITS_MIDDLE | DOOR_SWITCH_BITS_OPEN;
+	default:
+		return DOOR_SWITCH_BITS_CLOSED;
 	}
 }
 
@@ -773,7 +1104,7 @@ bool CSys246::Invoke001(uint32 method, uint32* args, uint32 argsSize, uint32* re
 			uint32 ramAddr = args[2];
 			uint32 dstPtr = args[4];
 			uint32 size = args[5];
-			CLog::GetInstance().Warn(LOG_NAME, "ReadExtRam(ramAddr = 0x%08X, dstPtr = 0x%08X, size = %d);\r\n",
+			ArcadeLog( "ReadExtRam(ramAddr = 0x%08X, dstPtr = 0x%08X, size = %d);\r\n",
 			                         ramAddr, dstPtr, size);
 			if(ramAddr >= 0x40000000 && ramAddr < 0x50000000)
 			{
@@ -803,7 +1134,7 @@ bool CSys246::Invoke001(uint32 method, uint32* args, uint32 argsSize, uint32* re
 		}
 		else
 		{
-			CLog::GetInstance().Warn(LOG_NAME, "Unknown args size for method 2: %d.\r\n", argsSize);
+			ArcadeLog( "Unknown args size for method 2: %d.\r\n", argsSize);
 		}
 	}
 	break;
@@ -813,7 +1144,7 @@ bool CSys246::Invoke001(uint32 method, uint32* args, uint32 argsSize, uint32* re
 			uint32 ramAddr = args[2];
 			uint32 srcPtr = args[4];
 			uint32 size = args[5];
-			CLog::GetInstance().Warn(LOG_NAME, "WriteExtRam(ramAddr = 0x%08X, srcPtr = 0x%08X, size = %d);\r\n",
+			ArcadeLog( "WriteExtRam(ramAddr = 0x%08X, srcPtr = 0x%08X, size = %d);\r\n",
 			                         ramAddr, srcPtr, size);
 			if(ramAddr >= 0x40000000 && ramAddr < 0x50000000)
 			{
@@ -828,7 +1159,7 @@ bool CSys246::Invoke001(uint32 method, uint32* args, uint32 argsSize, uint32* re
 		}
 		break;
 	default:
-		CLog::GetInstance().Warn(LOG_NAME, "Unknown method invoked (0x%08X, 0x%08X).\r\n", 0x001, method);
+		ArcadeLog( "Unknown method invoked (0x%08X, 0x%08X).\r\n", 0x001, method);
 		break;
 	}
 	return true;
@@ -844,13 +1175,13 @@ bool CSys246::Invoke003(uint32 method, uint32* args, uint32 argsSize, uint32* re
 	{
 	case 0x04:
 	{
-		CLog::GetInstance().Warn(LOG_NAME, "jvsif_registers(0x%08X, 0x%08X);\r\n", args[0], args[1]);
+		ArcadeLog( "jvsif_registers(0x%08X, 0x%08X);\r\n", args[0], args[1]);
 		uint32* params = reinterpret_cast<uint32*>(ram + args[0]);
 		uint32 recvSize = params[2];
 		uint32 recvAddr = params[3];
 		uint32 sendSize = params[6];
 		uint32 sendAddr = params[7];
-		CLog::GetInstance().Warn(LOG_NAME, "Setting JVIO params: recvSize = %d, recvAddr = 0x%08X, sendSize = %d, sendAddr = 0x%08X\r\n", recvSize, recvAddr, sendSize, sendAddr);
+		ArcadeLog( "Setting JVIO params: recvSize = %d, recvAddr = 0x%08X, sendSize = %d, sendAddr = 0x%08X\r\n", recvSize, recvAddr, sendSize, sendAddr);
 		m_recvAddr = recvAddr;
 		m_sendAddr = sendAddr;
 		//Set break and gaz values?
@@ -859,7 +1190,7 @@ bool CSys246::Invoke003(uint32 method, uint32* args, uint32 argsSize, uint32* re
 	}
 	break;
 	default:
-		CLog::GetInstance().Warn(LOG_NAME, "Unknown method invoked (0x%08X, 0x%08X).\r\n", 0x003, method);
+		ArcadeLog( "Unknown method invoked (0x%08X, 0x%08X).\r\n", 0x003, method);
 		break;
 	}
 	return true;
@@ -878,7 +1209,7 @@ bool CSys246::Invoke004(uint32 method, uint32* args, uint32 argsSize, uint32* re
 		reinterpret_cast<uint8*>(ret)[0x0E] = '1';
 		break;
 	default:
-		CLog::GetInstance().Warn(LOG_NAME, "Unknown method invoked (0x%08X, 0x%08X).\r\n", 0x004, method);
+		ArcadeLog( "Unknown method invoked (0x%08X, 0x%08X).\r\n", 0x004, method);
 		break;
 	}
 	return true;
@@ -886,12 +1217,16 @@ bool CSys246::Invoke004(uint32 method, uint32* args, uint32 argsSize, uint32* re
 
 bool CSys246::InvokeSerial(uint32 method, uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
 {
+	//Trace every call made on the arcade serial port (acuart): this is the port used by
+	//devices such as the card reader and the STR (BgStr) force feedback board.
+	ArcadeLog( "InvokeSerial(method = %d, argsSize = %d, retSize = %d);\r\n", static_cast<int>(method), static_cast<int>(argsSize), static_cast<int>(retSize));
 	switch(method)
 	{
 	case SERIAL_SETUP:
 	{
 		uint32 baud = args[0];
 		uint32 fifo = args[1];
+		ArcadeLog( "  SERIAL_SETUP(baud = %d, fifo = %d);\r\n", static_cast<int>(baud), static_cast<int>(fifo));
 		ret[0x00] = 0;
 	}
 	break;
@@ -911,6 +1246,7 @@ bool CSys246::InvokeSerial(uint32 method, uint32* args, uint32 argsSize, uint32*
 			length++;
 		}
 		ret[0x00] = length;
+		ArcadeLog( "  SERIAL_READ: %d bytes -> %s\r\n", length, FormatHexDump(response, static_cast<uint32>(length)).c_str());
 	}
 	break;
 	case SERIAL_WRITE:
@@ -918,8 +1254,10 @@ bool CSys246::InvokeSerial(uint32 method, uint32* args, uint32 argsSize, uint32*
 		uint32 length = args[0];
 		uint8* data = reinterpret_cast<uint8*>(args + 1);
 		assert(length <= argsSize - 4);
+		ArcadeLog( "  SERIAL_WRITE: %d bytes <- %s\r\n", static_cast<int>(length), FormatHexDump(data, length).c_str());
 		uint8* output = new uint8[length];
 		ProcessBgStrPacket(data, output, length);
+		ArcadeLog( "  SERIAL_WRITE: reply -> %s\r\n", FormatHexDump(output, length).c_str());
 		for(int i = 0; i < length; i++)
 		{
 			m_serialQueue.push(output[i]);
@@ -939,8 +1277,10 @@ bool CSys246::InvokeSerial(uint32 method, uint32* args, uint32 argsSize, uint32*
 		uint8* data = reinterpret_cast<uint8*>(args + 1);
 		assert(length <= argsSize - 4);
 		assert(length <= retSize - 4);
+		ArcadeLog( "  SERIAL_WRITE_READ: %d bytes <- %s\r\n", static_cast<int>(length), FormatHexDump(data, length).c_str());
 		ProcessBgStrPacket(data, reinterpret_cast<uint8*>(ret + 1), length);
 		ret[0x00] = length;
+		ArcadeLog( "  SERIAL_WRITE_READ: reply -> %s\r\n", FormatHexDump(reinterpret_cast<uint8*>(ret + 1), length).c_str());
 	}
 	break;
 	case SERIAL_12:
@@ -964,7 +1304,8 @@ bool CSys246::InvokeSerial(uint32 method, uint32* args, uint32 argsSize, uint32*
 	}
 	break;
 	default:
-		CLog::GetInstance().Warn(LOG_NAME, "Unknown method invoked (BgStr, 0x%08X).\r\n", method);
+		ArcadeLog( "Unknown method invoked (BgStr, 0x%08X).\r\n", method);
+		ArcadeLog( "  args: %s\r\n", FormatHexDump(reinterpret_cast<const uint8*>(args), argsSize).c_str());
 		break;
 	}
 	return true;
@@ -1021,6 +1362,25 @@ void CSys246::ProcessMemRequest(uint8* ram, uint32 infoPtr)
 		//CLog::GetInstance().Warn(LOG_NAME, "recving (dataPtr = 0x%08X);\r\n", dataPtr);
 		recvData[0] = sendData[0];
 		uint16 rootPktId = sendData[8];
+
+		//Dump the request buffer when it changes. This is where the arcade I/O commands
+		//live, including the digital outputs that drive things such as the shutter of the
+		//card reader. The comparison is done on the raw bytes to keep this path cheap,
+		//since it runs on every JVIO poll.
+		{
+			const uint8* sendBytes = reinterpret_cast<const uint8*>(sendData);
+			bool sendChanged = (m_lastJvioSendRaw.size() != 0x180) ||
+			                   (memcmp(m_lastJvioSendRaw.data(), sendBytes, 0x180) != 0);
+			if(sendChanged)
+			{
+				m_lastJvioSendRaw.assign(reinterpret_cast<const char*>(sendBytes), 0x180);
+				if((m_jvioSendDumpCount < 16) || ((m_jvioSendDumpCount % 256) == 0))
+				{
+					//CLog::GetInstance().Warn(LOG_NAME, "JVIO send buffer: %s\r\n", FormatHexDump(sendBytes, 0x180, 0x180).c_str());
+				}
+				m_jvioSendDumpCount++;
+			}
+		}
 		//Not sure if we need to check rootPktId, it seems to never be set by Taito games.
 		if((sendData[0] == 0x3E6F) /* && (rootPktId != 0)*/)
 		{
@@ -1042,7 +1402,12 @@ void CSys246::ProcessMemRequest(uint8* ram, uint32 infoPtr)
 			uint16 pktId = sendData[0x0C];
 			if(pktId != 0)
 			{
-				CLog::GetInstance().Warn(LOG_NAME, "PktId: 0x%04X\r\n", pktId);
+				//This runs on every JVIO poll, so only produce a few entries
+				m_pktIdLogCount++;
+				if((m_pktIdLogCount <= 8) || ((m_pktIdLogCount % 4096) == 0))
+				{
+					ArcadeLog( "PktId: 0x%04X\r\n", pktId);
+				}
 				if(reinterpret_cast<const uint8*>(sendData)[0x122] == JVS_SYNC)
 				{
 					ProcessJvsPacket(reinterpret_cast<const uint8*>(sendData) + 0x122, reinterpret_cast<uint8*>(recvData) + 0x15A);
@@ -1059,7 +1424,7 @@ void CSys246::ProcessMemRequest(uint8* ram, uint32 infoPtr)
 		}
 		else
 		{
-			CLog::GetInstance().Warn(LOG_NAME, "UNK SENDDATA: 0x%04X\r\n", sendData[0]);
+			ArcadeLog( "UNK SENDDATA: 0x%04X\r\n", sendData[0]);
 		}
 	}
 	else if((info[1] >= 0x40000000) && (info[1] < 0x50000000))
@@ -1084,10 +1449,10 @@ void CSys246::ProcessMemRequest(uint8* ram, uint32 infoPtr)
 	}
 	else
 	{
-		CLog::GetInstance().Warn(LOG_NAME, "Unknown Packet\r\n");
-		CLog::GetInstance().Warn(LOG_NAME, "info[_0 = 0x%08X, _1 = 0x%08X, _2 = 0x%08X, _3 = 0x%08X];\r\n",
+		ArcadeLog( "Unknown Packet\r\n");
+		ArcadeLog( "info[_0 = 0x%08X, _1 = 0x%08X, _2 = 0x%08X, _3 = 0x%08X];\r\n",
 		                         info[0], info[1], info[2], info[3]);
-		CLog::GetInstance().Warn(LOG_NAME, "------------------------------------------\r\n");
+		ArcadeLog( "------------------------------------------\r\n");
 	}
 }
 
@@ -1096,7 +1461,7 @@ void CSys246::ReadBackupRam(uint32 backupRamAddr, uint8* buffer, uint32 size)
 	memset(buffer, 0, size);
 	if((backupRamAddr >= BACKUP_RAM_SIZE) || ((backupRamAddr + size) > BACKUP_RAM_SIZE))
 	{
-		CLog::GetInstance().Warn(LOG_NAME, "Reading outside of backup RAM bounds.\r\n");
+		ArcadeLog( "Reading outside of backup RAM bounds.\r\n");
 		return;
 	}
 	auto backupRamPath = GetArcadeSavePath() / (m_gameId + ".backupram");
@@ -1113,7 +1478,7 @@ void CSys246::WriteBackupRam(uint32 backupRamAddr, const uint8* buffer, uint32 s
 {
 	if((backupRamAddr >= BACKUP_RAM_SIZE) || ((backupRamAddr + size) > BACKUP_RAM_SIZE))
 	{
-		CLog::GetInstance().Warn(LOG_NAME, "Writing outside of backup RAM bounds.\r\n");
+		ArcadeLog( "Writing outside of backup RAM bounds.\r\n");
 		return;
 	}
 	auto arcadeSavePath = GetArcadeSavePath();
