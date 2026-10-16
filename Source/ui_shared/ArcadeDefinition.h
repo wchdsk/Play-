@@ -56,6 +56,10 @@ struct ARCADE_MACHINE_DEF
 	//Name of the serial port the arcade card reader is attached to (for example
 	//"COM6"). Empty means no port is opened and the reader is emulated internally.
 	std::string arcadeSerialPort;
+	//When set, the emulated card reader handles the card protocol itself. When clear the
+	//commands are only forwarded to arcadeSerialPort, which is what an external reader
+	//manager expects.
+	bool useInternalCardReader = true;
 	std::optional<IlinkId> ilinkId;
 	std::array<float, 4> screenPosXform = {65535, 0, 65535, 0};
 	uint32 eeFreqScaleNumerator = 1;

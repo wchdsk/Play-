@@ -21,6 +21,9 @@ namespace Iop
 		class CArcadeSpy : public CModule
 		{
 		public:
+			//With the internal reader disabled the card commands are only forwarded to the
+			//serial port, leaving the cards to the real hardware or an external manager.
+			void SetInternalCardReader(bool value) { m_internalCardReader = value; }
 			CArcadeSpy(std::string, uint8*);
 
 			std::string GetId() const override;
@@ -121,6 +124,10 @@ namespace Iop
 			//Cards are inserted and ejected by hand through <Play! data path>/arcade_card.txt
 			//("feed", "insert=N", "eject", "take", "dispenser=N", "slot=N", "auto", "manual")
 			fs::path m_cardControlPath;
+			//When clear, the reader only forwards what it receives and lets the real hardware (or
+			//an external manager on the serial port) handle the card protocol.
+			bool m_internalCardReader = true;
+
 			fs::file_time_type m_cardControlTime;
 			bool m_cardControlLoaded = false;
 			uint32 m_cardControlCheckCounter = 0;

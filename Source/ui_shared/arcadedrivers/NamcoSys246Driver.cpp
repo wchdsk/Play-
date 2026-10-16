@@ -166,7 +166,9 @@ void CNamcoSys246Driver::PrepareEnvironment(CPS2VM* virtualMachine, const ARCADE
 			};
 			for(const char* arcadeModuleId : arcadeModuleIds)
 			{
-				iopBios->RegisterModule(std::make_shared<Iop::Namco::CArcadeSpy>(arcadeModuleId, virtualMachine->m_iop->m_ram));
+				auto arcadeModule = std::make_shared<Iop::Namco::CArcadeSpy>(arcadeModuleId, virtualMachine->m_iop->m_ram);
+				arcadeModule->SetInternalCardReader(def.useInternalCardReader);
+				iopBios->RegisterModule(arcadeModule);
 			}
 		}
 	}

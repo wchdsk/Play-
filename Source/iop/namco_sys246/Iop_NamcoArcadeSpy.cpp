@@ -1,4 +1,5 @@
 #include "Iop_NamcoArcadeSpy.h"
+#include "../../app_shared/Log.h"
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
@@ -25,39 +26,14 @@ namespace
 	//Card reader entries are written straight to <Play! data path>/arcade_card_log.txt
 	//instead of going through CLog: this keeps them available even when the emulator is
 	//built with LOGGING_ENABLED 0, which compiles every CLog call out for speed.
-	void CardLog(const char* format, ...)
-	{
-		static std::ofstream logStream;
-		if(!logStream.is_open())
-		{
-			auto logPath = CAppConfig::GetInstance().GetBasePath() / "arcade_card_log.txt";
-			//Binary mode: the entries already contain their own line endings and text mode
-			//would translate them again, which adds a blank line after every entry. Append
-			//mode because the shutter writes into the same file from another unit.
-			logStream.open(logPath.native().c_str(), std::ios::out | std::ios::app | std::ios::binary);
-			if(!logStream.is_open()) return;
-		}
-		va_list args;
-		va_start(args, format);
-		char buffer[1024];
-		vsnprintf(buffer, sizeof(buffer), format, args);
-		va_end(args);
-
-		//Every entry is stamped with the time since the process started: this tells a delay of
-		//the emulator apart from a delay of the game, which polls the reader at its own pace.
-		//Without it, a control that only reaches the game on its next poll looks like a bug of
-		//the emulation.
-		{
-			auto now = std::chrono::steady_clock::now();
-			auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-			char timestamp[32];
-			snprintf(timestamp, sizeof(timestamp), "[%d.%03d] ",
-			         static_cast<int>(elapsed / 1000), static_cast<int>(elapsed % 1000));
-			logStream << timestamp;
-		}
-		logStream << buffer;
-		logStream.flush();
-	}
+	//Card reader entries go through CLog like the rest of the emulator, so log.showprints
+//and LOGGING_ENABLED decide whether they are produced. Expanding to a macro also keeps
+//the argument formatting (and the hex dumps) out of builds where logging is compiled out.
+#if LOGGING_ENABLED
+#define CardLog(...) CLog::GetInstance().Print("arcade_card", __VA_ARGS__)
+#else
+#define CardLog(...) do { } while(0)
+#endif
 
 	//Calls are logged in full for the first few occurrences of each function, then only
 	//once in a while: drivers tend to poll some functions thousands of times in a row.
@@ -1219,6 +1195,10 @@ void CArcadeSpy::AdvanceCard()
 
 void CArcadeSpy::HandleCardRequest(const uint8* frame, uint32 size)
 {
+	//With the internal reader disabled the card protocol is not answered here: the
+	//commands keep going to the serial port so an external reader manager can handle them.
+	if(!m_internalCardReader) return;
+
 	uint8 command = 0;
 	uint32 blockId = 0;
 	const uint8* payload = nullptr;

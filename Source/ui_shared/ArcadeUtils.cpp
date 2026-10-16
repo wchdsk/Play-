@@ -230,6 +230,10 @@ ARCADE_MACHINE_DEF ReadArcadeMachineDefinition(const fs::path& arcadeDefPath)
 	{
 		def.arcadeSerialPort = defJson["arcadeSerialPort"];
 	}
+	if(defJson.contains("useInternalCardReader"))
+	{
+		def.useInternalCardReader = defJson["useInternalCardReader"];
+	}
 	if(defJson.contains("screenPosXform"))
 	{
 		auto screenPosXformArray = defJson["screenPosXform"];
