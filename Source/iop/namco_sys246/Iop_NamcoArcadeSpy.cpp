@@ -501,7 +501,9 @@ void CArcadeSpy::QueueUartCommand(const uint8* command, uint32 size)
 
 	//The commands that were captured on a real reader follow the protocol exactly: the frame
 	//is acknowledged with 0x06 and the result is fetched by the game with 0x05
-	if(HandleModelledCardCommand(command, size)) return;
+	//With the internal reader disabled nothing is answered here: the commands were already
+	//forwarded to the serial port above, for the real hardware or an external manager.
+	if(m_internalCardReader && HandleModelledCardCommand(command, size)) return;
 
 	//The modelled reader does not know this command. Answer it like a real reader would,
 	//otherwise the game never gets an acknowledge or a reply and reports an error. This
