@@ -1,3 +1,8 @@
+//Logging is compiled out for this unit: it produces an entry for every DMA transfer and
+//every access to an unimplemented register. Remove this define to get the "ee_dmac" entries
+//back.
+#define LOGGING_ENABLED 0
+
 #include <cstring>
 #include <stdio.h>
 #include "DMAC.h"

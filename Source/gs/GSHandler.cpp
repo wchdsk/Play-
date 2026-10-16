@@ -1,3 +1,8 @@
+//Logging is compiled out for this unit: it produces entries for every register write and
+//every transfer, and the strings they build (including a disassembly per write) cost a lot
+//of time while a game runs. Remove this define to get the "gs" entries back.
+#define LOGGING_ENABLED 0
+
 #include <stdio.h>
 #include <string.h>
 #include <functional>
