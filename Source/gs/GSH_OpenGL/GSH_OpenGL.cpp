@@ -2,6 +2,8 @@
 #include <assert.h>
 #include <cstring>
 #include <math.h>
+#include <algorithm>
+#include <vector>
 
 #include "AppConfig.h"
 #include "../GsPixelFormats.h"
@@ -2154,50 +2156,202 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
 
 void CGSH_OpenGL::ProcessLocalToHostTransfer()
 {
-	//This is constrained to work only with ps2autotest, will be unconstrained later
+	//Mirrors the behaviour of the Vulkan backend: the transfer read handler (ReadImageData)
+	//reads out of GS RAM, so GS RAM has to contain whatever the GPU has produced so far.
+	//Unlike Vulkan, the framebuffer contents only exist inside OpenGL objects here, so the
+	//framebuffer ranges touched by this transfer have to be read back into RAM.
+
+	bool readsEnabled = CAppConfig::GetInstance().GetPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED);
+	if(!readsEnabled) return;
 
 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
-	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
 	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
+	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
 
-	if(bltBuf.nSrcPsm != PSMCT32) return;
-
-	uint32 transferAddress = bltBuf.GetSrcPtr();
-	if(transferAddress != 0) return;
-
-	if((trxReg.nRRW != 32) || (trxReg.nRRH != 32)) return;
-	if((trxPos.nSSAX != 0) || (trxPos.nSSAY != 0)) return;
-
-	auto framebufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
-	                                        [](const FramebufferPtr& framebuffer) {
-		                                        return (framebuffer->m_psm == PSMCT32) && (framebuffer->m_basePtr == 0);
-	                                        });
-	if(framebufferIterator == std::end(m_framebuffers)) return;
-	const auto& framebuffer = (*framebufferIterator);
-
+	//Commit whatever is still sitting in the vertex buffer before reading anything back
 	FlushVertexBuffer();
 	m_renderState.isValid = false;
 
-	auto pixels = new uint32[trxReg.nRRW * trxReg.nRRH];
+	auto [copyBase, copySize] = GsTransfer::GetSrcRange(bltBuf, trxReg, trxPos);
 
-	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_framebuffer);
-	glReadPixels(trxPos.nSSAX, trxPos.nSSAY, trxReg.nRRW, trxReg.nRRH, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-	CHECKGLERROR();
-
-	//Write back to RAM
+	//Some games do that, example: Star Ocean 3
+	if(copyBase >= CGSHandler::RAMSIZE) return;
+	if((copyBase + copySize) > CGSHandler::RAMSIZE)
 	{
-		CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, bltBuf.GetSrcPtr(), bltBuf.nSrcWidth);
-		for(uint32 y = trxPos.nSSAY; y < (trxPos.nSSAY + trxReg.nRRH); y++)
+		copySize = CGSHandler::RAMSIZE - copyBase;
+	}
+
+	//Preferred path: the transfer reads this framebuffer from its very start, so the
+	//exact pixel rectangle is known from TRXPOS/TRXREG. Reading only that area is both
+	//cheaper and unambiguous (framebuffers may overlap in VRAM).
+	for(const auto& framebuffer : m_framebuffers)
+	{
+		if((framebuffer->m_basePtr == bltBuf.GetSrcPtr()) &&
+		   IsCompatibleFramebufferPSM(framebuffer->m_psm, bltBuf.nSrcPsm) &&
+		   (framebuffer->m_width == bltBuf.GetSrcWidth()))
 		{
-			for(uint32 x = trxPos.nSSAX; x < (trxPos.nSSAX + trxReg.nRRH); x++)
-			{
-				uint32 pixel = pixels[x + (y * trxReg.nRRW)];
-				indexor.SetPixel(x, y, pixel);
-			}
+			ReadBackFramebufferPixels(framebuffer, trxPos.nSSAX, trxPos.nSSAY, trxReg.nRRW, trxReg.nRRH);
+
+			//RAM changed, so anything sampled from there is now stale
+			m_renderState.isTextureStateValid = false;
+			m_textureCache.InvalidateRange(copyBase, copySize);
+			return;
 		}
 	}
 
-	delete[] pixels;
+	//Fallback: sync every framebuffer overlapping the touched range, page granular.
+	for(const auto& framebuffer : m_framebuffers)
+	{
+		ReadBackFramebufferRange(framebuffer, copyBase, copySize);
+	}
+
+	//RAM changed, so anything sampled from there is now stale
+	m_renderState.isTextureStateValid = false;
+	m_textureCache.InvalidateRange(copyBase, copySize);
+}
+
+void CGSH_OpenGL::ReadBackFramebufferRange(const FramebufferPtr& framebuffer, uint32 memoryStart, uint32 memorySize)
+{
+	uint32 areaBase = framebuffer->m_basePtr;
+	uint32 areaSize = framebuffer->m_cachedArea.GetSize();
+
+	if((framebuffer->m_width == 0) || (framebuffer->m_height == 0)) return;
+	if((memoryStart >= (areaBase + areaSize)) || ((memoryStart + memorySize) <= areaBase)) return;
+
+	uint32 psm = framebuffer->m_psm;
+	auto pageSize = CGsPixelFormats::GetPsmPageSize(psm);
+	uint32 pageCountX = (framebuffer->m_width + pageSize.first - 1) / pageSize.first;
+
+	//Find the pages touched by the requested range
+	uint32 rangeStart = (memoryStart > areaBase) ? (memoryStart - areaBase) : 0;
+	uint32 rangeEnd = std::min<uint32>(memoryStart + memorySize, areaBase + areaSize) - areaBase;
+
+	if((rangeEnd == 0) || (rangeStart >= rangeEnd)) return;
+
+	uint32 firstPage = rangeStart / CGsPixelFormats::PAGESIZE;
+	uint32 lastPage = (rangeEnd - 1) / CGsPixelFormats::PAGESIZE;
+
+	uint32 firstPageY = firstPage / pageCountX;
+	uint32 lastPageY = lastPage / pageCountX;
+
+	//A linear page index wraps at the end of a page row, so "first" and "last" alone do not
+	//give a valid box: if the range spans several rows it covers whole rows, otherwise the
+	//two indices are on the same row and can be used directly.
+	uint32 minPageX = 0;
+	uint32 maxPageX = (pageCountX > 0) ? (pageCountX - 1) : 0;
+	if(firstPageY == lastPageY)
+	{
+		minPageX = firstPage % pageCountX;
+		maxPageX = lastPage % pageCountX;
+	}
+
+	uint32 rectX = minPageX * pageSize.first;
+	uint32 rectY = firstPageY * pageSize.second;
+	uint32 rectWidth = (maxPageX - minPageX + 1) * pageSize.first;
+	uint32 rectHeight = (lastPageY - firstPageY + 1) * pageSize.second;
+
+	ReadBackFramebufferPixels(framebuffer, rectX, rectY, rectWidth, rectHeight);
+}
+
+void CGSH_OpenGL::ReadBackFramebufferPixels(const FramebufferPtr& framebuffer, uint32 rectX, uint32 rectY, uint32 rectWidth, uint32 rectHeight)
+{
+	uint32 areaBase = framebuffer->m_basePtr;
+	uint32 psm = framebuffer->m_psm;
+
+	if((rectX >= framebuffer->m_width) || (rectY >= framebuffer->m_height)) return;
+	rectWidth = std::min<uint32>(rectWidth, framebuffer->m_width - rectX);
+	rectHeight = std::min<uint32>(rectHeight, framebuffer->m_height - rectY);
+	if((rectWidth == 0) || (rectHeight == 0)) return;
+
+	//Only formats we can express as render targets are readable
+	switch(psm)
+	{
+	case PSMCT32:
+	case PSMCT24:
+	case PSMCT16:
+	case PSMCT16S:
+		break;
+	default:
+		return;
+	}
+
+	//Read that area out of the renderer's framebuffer
+	uint32 scale = std::max<uint32>(m_fbScale, 1);
+	uint32 readWidth = rectWidth * scale;
+	uint32 readHeight = rectHeight * scale;
+
+	GLuint sourceFramebuffer = framebuffer->m_framebuffer;
+	if(m_multisampleEnabled)
+	{
+		ResolveFramebufferMultisample(framebuffer, m_fbScale);
+		sourceFramebuffer = framebuffer->m_resolveFramebuffer;
+	}
+
+	std::vector<uint32> pixels(readWidth * readHeight);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, sourceFramebuffer);
+	glReadPixels(rectX * scale, rectY * scale, readWidth, readHeight, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+	CHECKGLERROR();
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	//We bound a framebuffer behind the render state's back
+	m_validGlState &= ~GLSTATE_FRAMEBUFFER;
+
+	//Pixels come back as RGBA bytes, one GS pixel every 'scale' texels
+	const auto readPixel =
+	    [&](uint32 x, uint32 y) {
+		    return pixels[(y * scale) * readWidth + (x * scale)];
+	    };
+
+	const auto writePixels16 =
+	    [&](auto& indexor) {
+		    for(uint32 y = 0; y < rectHeight; y++)
+		    {
+			    for(uint32 x = 0; x < rectWidth; x++)
+			    {
+				    uint32 pixel = readPixel(x, y);
+				    uint32 r = (pixel >> 0) & 0xFF;
+				    uint32 g = (pixel >> 8) & 0xFF;
+				    uint32 b = (pixel >> 16) & 0xFF;
+				    uint32 a = (pixel >> 24) & 0xFF;
+				    uint16 packed = static_cast<uint16>(((r >> 3) << 0) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15));
+				    indexor.SetPixel(rectX + x, rectY + y, packed);
+			    }
+		    }
+	    };
+
+	switch(psm)
+	{
+	case PSMCT32:
+	case PSMCT24:
+	{
+		uint32 mask = (psm == PSMCT24) ? 0x00FFFFFF : 0xFFFFFFFF;
+		CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, areaBase, framebuffer->m_width / 64);
+		for(uint32 y = 0; y < rectHeight; y++)
+		{
+			for(uint32 x = 0; x < rectWidth; x++)
+			{
+				indexor.SetPixel(rectX + x, rectY + y, readPixel(x, y) & mask);
+			}
+		}
+	}
+	break;
+	case PSMCT16:
+	{
+		CGsPixelFormats::CPixelIndexorPSMCT16 indexor(m_pRAM, areaBase, framebuffer->m_width / 64);
+		writePixels16(indexor);
+	}
+	break;
+	case PSMCT16S:
+	{
+		CGsPixelFormats::CPixelIndexorPSMCT16S indexor(m_pRAM, areaBase, framebuffer->m_width / 64);
+		writePixels16(indexor);
+	}
+	break;
+	default:
+		assert(false);
+		break;
+	}
 }
 
 void CGSH_OpenGL::ProcessLocalToLocalTransfer()

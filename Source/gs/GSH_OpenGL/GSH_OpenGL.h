@@ -417,6 +417,8 @@ private:
 
 	void PopulateFramebuffer(const FramebufferPtr&);
 	void CommitFramebufferDirtyPages(const FramebufferPtr&, unsigned int, unsigned int);
+	void ReadBackFramebufferRange(const FramebufferPtr&, uint32, uint32);
+	void ReadBackFramebufferPixels(const FramebufferPtr&, uint32, uint32, uint32, uint32);
 	void ResolveFramebufferMultisample(const FramebufferPtr&, uint32);
 
 	Framework::OpenGl::ProgramPtr m_presentProgram;
